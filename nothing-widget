@@ -121,8 +121,21 @@ export default function App() {
                 moduleInstanceMemory = instance.exports.memory;
                 doomInstanceRef.current = instance.exports;
 
-                instance.exports.initGame();
-                tickIntervalRef.current = setInterval(instance.exports.tickGame, 1000 / 35);
+                // Defer the game start routine slightly so the DOM can settle
+                setTimeout(() => {
+                    if (isDestroyed) return;
+                    try {
+                        console.log('[Doom] Init Game...');
+                        instance.exports.initGame();
+
+                        console.log('[Doom] Starting tick interval...');
+                        tickIntervalRef.current = setInterval(instance.exports.tickGame, 1000 / 35);
+                    } catch (err) {
+                        console.error('[Doom] Critical runtime Crash inside WASM:', err);
+                        setStatusMessage('RUNTIME CRASH');
+                    }
+                }, 100);
+
             } catch (err) {
                 console.error('Failed to init DOOM:', err);
                 if (!isDestroyed) setStatusMessage('FAILED TO BOOT');
