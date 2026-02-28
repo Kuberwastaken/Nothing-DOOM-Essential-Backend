@@ -60,39 +60,49 @@ export default function App() {
     useEffect(() => {
         let isDestroyed = false;
 
-        const WIDTH = 320;
-        const HEIGHT = 200;
-        const PIXEL_DATA_SIZE = WIDTH * HEIGHT * 4;
-        const bmpBuffer = new Uint8Array(54 + PIXEL_DATA_SIZE);
-
-        const bmpView = new DataView(bmpBuffer.buffer);
-        bmpView.setUint16(0, 0x4D42, false);
-        bmpView.setUint32(2, bmpBuffer.length, true);
-        bmpView.setUint32(10, 54, true);
-        bmpView.setUint32(14, 40, true);
-        bmpView.setUint32(18, WIDTH, true);
-        bmpView.setInt32(22, -HEIGHT, true);
-        bmpView.setUint16(26, 1, true);
-        bmpView.setUint16(28, 32, true);
-        bmpView.setUint32(30, 0, true);
-
+        let CURRENT_WIDTH = 0;
+        let CURRENT_HEIGHT = 0;
+        let PIXEL_DATA_SIZE = 0;
+        let bmpBuffer: Uint8Array | null = null;
         let moduleInstanceMemory: any = null;
 
         const imports = {
             loading: {
                 onGameInit: (width: number, height: number) => {
                     addLog(`Game Init: ${width}x${height}`);
+                    CURRENT_WIDTH = width;
+                    CURRENT_HEIGHT = height;
+                    PIXEL_DATA_SIZE = width * height * 4;
+
+                    bmpBuffer = new Uint8Array(54 + PIXEL_DATA_SIZE);
+                    const bmpView = new DataView(bmpBuffer.buffer);
+
+                    bmpView.setUint16(0, 0x4D42, false);
+                    bmpView.setUint32(2, bmpBuffer.length, true);
+                    bmpView.setUint32(10, 54, true);
+                    bmpView.setUint32(14, 40, true);
+                    bmpView.setUint32(18, CURRENT_WIDTH, true);
+                    bmpView.setInt32(22, -CURRENT_HEIGHT, true);
+                    bmpView.setUint16(26, 1, true);
+                    bmpView.setUint16(28, 32, true);
+                    bmpView.setUint32(30, 0, true);
                 },
                 wadSizes: () => { },
                 readWads: () => { },
             },
             ui: {
                 drawFrame: (indexOfFrameBuffer: number) => {
-                    if (isDestroyed || !moduleInstanceMemory) return;
+                    if (isDestroyed || !moduleInstanceMemory || !bmpBuffer) return;
                     try {
                         if (frameCountRef.current === 0) addLog('DRAWN FIRST FRAME!');
                         if (frameCountRef.current === 35) addLog('DRAWN 35 FRAMES!');
                         frameCountRef.current++;
+
+                        // Bounds check gracefully
+                        if (moduleInstanceMemory.buffer.byteLength < indexOfFrameBuffer + PIXEL_DATA_SIZE) {
+                            if (frameCountRef.current < 5) addLog('CRASH: Memory Underflow!');
+                            return;
+                        }
 
                         const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, PIXEL_DATA_SIZE);
                         bmpBuffer.set(doomPixels, 54);
