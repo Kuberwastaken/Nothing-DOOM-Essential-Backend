@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { View, Text, StyleSheet, Pressable, Animated, Image, SafeAreaView } from 'react-native';
 import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler';
+import { tokens } from './src/styles/tokens';
 
 const REMOTE_WASM_URL = 'https://kuber.studio/Nothing-DOOM-Essential-Backend/build/doom.wasm';
 
@@ -74,9 +75,8 @@ export default function App() {
       OUT_W = 0,
       OUT_H = 0;
 
-    // BMP packing
-    let ROW_SIZE = 0; // padded row size in bytes
-    let PAD = 0; // padding bytes per row
+    let ROW_SIZE = 0;
+    let PAD = 0;
 
     let bmpBuf: Uint8Array | null = null;
     let wMem: any = null;
@@ -104,7 +104,6 @@ export default function App() {
           OUT_W = Math.floor(w / 2);
           OUT_H = Math.floor(h / 2);
 
-          // 24bpp BMP rows must be padded to multiples of 4 bytes
           ROW_SIZE = (OUT_W * 3 + 3) & ~3;
           PAD = ROW_SIZE - OUT_W * 3;
           const imageSize = ROW_SIZE * OUT_H;
@@ -112,27 +111,24 @@ export default function App() {
           bmpBuf = new Uint8Array(54 + imageSize);
           const v = new DataView(bmpBuf.buffer);
 
-          // --- BMP FILE HEADER (14 bytes) ---
-          // Fix: write literal 'B','M' so endianness can’t bite you.
-          v.setUint8(0, 0x42); // 'B'
-          v.setUint8(1, 0x4d); // 'M'
-          v.setUint32(2, bmpBuf.length, true); // file size
-          v.setUint16(6, 0, true); // reserved1
-          v.setUint16(8, 0, true); // reserved2
-          v.setUint32(10, 54, true); // pixel data offset
+          v.setUint8(0, 0x42);
+          v.setUint8(1, 0x4d);
+          v.setUint32(2, bmpBuf.length, true);
+          v.setUint16(6, 0, true);
+          v.setUint16(8, 0, true);
+          v.setUint32(10, 54, true);
 
-          // --- DIB HEADER: BITMAPINFOHEADER (40 bytes) ---
-          v.setUint32(14, 40, true); // header size
+          v.setUint32(14, 40, true);
           v.setInt32(18, OUT_W, true);
-          v.setInt32(22, -OUT_H, true); // negative => top-down
-          v.setUint16(26, 1, true); // planes
-          v.setUint16(28, 24, true); // bpp
-          v.setUint32(30, 0, true); // compression = BI_RGB
-          v.setUint32(34, imageSize, true); // biSizeImage (helps some decoders)
-          v.setInt32(38, 0, true); // x pixels per meter
-          v.setInt32(42, 0, true); // y pixels per meter
-          v.setUint32(46, 0, true); // colors used
-          v.setUint32(50, 0, true); // important colors
+          v.setInt32(22, -OUT_H, true);
+          v.setUint16(26, 1, true);
+          v.setUint16(28, 24, true);
+          v.setUint32(30, 0, true);
+          v.setUint32(34, imageSize, true);
+          v.setInt32(38, 0, true);
+          v.setInt32(42, 0, true);
+          v.setUint32(46, 0, true);
+          v.setUint32(50, 0, true);
 
           setDbg(`INIT ${w}x${h} -> ${OUT_W}x${OUT_H}`);
         },
@@ -161,7 +157,6 @@ export default function App() {
               fireKey(K.ENTER, 1200);
             }
 
-            // render every other frame
             if (fc % 2 !== 0) return;
 
             const needed = WASM_W * WASM_H * 4;
@@ -172,19 +167,17 @@ export default function App() {
 
             const src = new Uint8Array(wMem.buffer, idx, needed);
 
-            // write BMP pixel data (BGR) with row padding
             let dst = 54;
             for (let y = 0; y < OUT_H; y++) {
               const srcRow = y * 2 * WASM_W * 4;
 
               for (let x = 0; x < OUT_W; x++) {
                 const s = srcRow + x * 2 * 4;
-                bmpBuf[dst++] = src[s + 2]; // B
-                bmpBuf[dst++] = src[s + 1]; // G
-                bmpBuf[dst++] = src[s + 0]; // R
+                bmpBuf[dst++] = src[s + 0];
+                bmpBuf[dst++] = src[s + 1];
+                bmpBuf[dst++] = src[s + 2];
               }
 
-              // pad row to 4-byte boundary
               for (let i = 0; i < PAD; i++) bmpBuf[dst++] = 0;
             }
 
@@ -342,7 +335,6 @@ export default function App() {
     <SafeAreaView style={styles.safe}>
       <GestureHandlerRootView style={styles.root}>
         <View style={styles.layout}>
-          {/* LEFT */}
           <View style={styles.leftCol}>
             <View style={styles.strafeRow}>
               <Btn label="◄" sub="STR" doomKey="," s={styles.strafeBtn} />
@@ -360,11 +352,9 @@ export default function App() {
             <Text style={styles.moveLabel}>MOVE</Text>
           </View>
 
-          {/* SCREEN */}
           <View style={styles.screen}>
             {doomFrameUri ? (
               <Image
-                // No vertical flip needed because BMP height is negative (top-down)
                 source={{ uri: doomFrameUri }}
                 style={styles.gameImg}
                 resizeMode="stretch"
@@ -374,17 +364,11 @@ export default function App() {
               <View style={styles.gameImg} />
             )}
 
-            {/* Debug overlay */}
             <View style={styles.dbgWrap} pointerEvents="none">
               <Text style={styles.dbgTxt}>{dbg}</Text>
             </View>
-
-            <View style={styles.badge} pointerEvents="none">
-              <Text style={styles.badgeTxt}>DOOM</Text>
-            </View>
           </View>
 
-          {/* RIGHT */}
           <View style={styles.rightCol}>
             <Btn label="FIRE" doomKey="Control" s={styles.fireBtn} ls={styles.fireTxt} />
             <Btn label="USE" doomKey=" " s={styles.useBtn} />
@@ -399,15 +383,8 @@ export default function App() {
   );
 }
 
-const ACCENT = '#FF2020';
-const BG = '#0d0d0d';
-const MID = '#1c1c1c';
-const RAISED = '#2a2a2a';
-const DIM = '#484848';
-const WHITE = '#efefef';
-
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: BG },
+  safe: { flex: 1, backgroundColor: '#000' },
   root: { flex: 1 },
   layout: { flex: 1, flexDirection: 'row', padding: 8, gap: 7, alignItems: 'stretch' },
 
@@ -419,26 +396,23 @@ const styles = StyleSheet.create({
     width: JOYSTICK_SIZE,
     height: JOYSTICK_SIZE,
     borderRadius: JOYSTICK_SIZE / 2,
-    backgroundColor: MID,
-    borderWidth: 1.5,
-    borderColor: RAISED,
+    backgroundColor: '#1a1a1a',
+    borderWidth: 2,
+    borderColor: '#333',
     justifyContent: 'center',
     alignItems: 'center',
   },
-  stickH: { position: 'absolute', width: '55%', height: 1, backgroundColor: RAISED },
-  stickV: { position: 'absolute', width: 1, height: '55%', backgroundColor: RAISED },
+  stickH: { position: 'absolute', width: '55%', height: 1, backgroundColor: '#444' },
+  stickV: { position: 'absolute', width: 1, height: '55%', backgroundColor: '#444' },
   stickKnob: {
     width: JOYSTICK_KNOB,
     height: JOYSTICK_KNOB,
     borderRadius: JOYSTICK_KNOB / 2,
-    backgroundColor: WHITE,
-    shadowColor: '#fff',
-    shadowOpacity: 0.12,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 0 },
-    elevation: 4,
+    backgroundColor: tokens.colors.light,
+    borderWidth: 1,
+    borderColor: '#ddd',
   },
-  moveLabel: { fontSize: 7, fontWeight: '700', color: DIM, letterSpacing: 2 },
+  moveLabel: { fontSize: 7, fontWeight: '700', color: '#555', letterSpacing: 2 },
 
   screen: { flex: 1, borderRadius: 8, overflow: 'hidden', backgroundColor: '#000' },
   gameImg: { flex: 1, backgroundColor: '#000' },
@@ -446,37 +420,24 @@ const styles = StyleSheet.create({
   dbgWrap: { position: 'absolute', top: 4, left: 6 },
   dbgTxt: { color: '#00ff00', fontSize: 7, fontWeight: '700', fontFamily: 'monospace' },
 
-  badge: {
-    position: 'absolute',
-    top: 4,
-    right: 5,
-    backgroundColor: 'rgba(0,0,0,0.75)',
-    paddingHorizontal: 4,
-    paddingVertical: 1,
-    borderRadius: 3,
-    borderWidth: 1,
-    borderColor: ACCENT,
-  },
-  badgeTxt: { color: ACCENT, fontSize: 6, fontWeight: '900', letterSpacing: 2 },
-
   rightCol: { width: 60, gap: 5, justifyContent: 'flex-end', paddingBottom: 2 },
   btn: {
     borderRadius: 9,
     justifyContent: 'center',
     alignItems: 'center',
     paddingVertical: 5,
-    backgroundColor: RAISED,
+    backgroundColor: '#222',
     borderWidth: 1,
-    borderColor: '#333',
+    borderColor: '#444',
     minHeight: 28,
   },
-  btnDown: { backgroundColor: '#444', borderColor: '#555' },
-  btnTxt: { color: WHITE, fontSize: 8, fontWeight: '800', letterSpacing: 1 },
-  btnSub: { color: DIM, fontSize: 6, fontWeight: '600', letterSpacing: 1, marginTop: 1 },
+  btnDown: { backgroundColor: '#333', borderColor: '#555' },
+  btnTxt: { color: tokens.colors.light, fontSize: 8, fontWeight: '800', letterSpacing: 1 },
+  btnSub: { color: '#666', fontSize: 6, fontWeight: '600', letterSpacing: 1, marginTop: 1 },
 
-  fireBtn: { flex: 1, backgroundColor: '#1a0000', borderColor: ACCENT, borderWidth: 1.5 },
-  fireTxt: { color: ACCENT, fontSize: 10, fontWeight: '900', letterSpacing: 2 },
+  fireBtn: { flex: 1, backgroundColor: '#1a0000', borderColor: tokens.colors.red, borderWidth: 1.5 },
+  fireTxt: { color: tokens.colors.red, fontSize: 10, fontWeight: '900', letterSpacing: 2 },
   useBtn: { flex: 1 },
   utilRow: { flexDirection: 'row', gap: 4 },
-  utilBtn: { flex: 1, backgroundColor: MID, borderColor: '#252525' },
+  utilBtn: { flex: 1, backgroundColor: '#1a1a1a', borderColor: '#2a2a2a' },
 });
