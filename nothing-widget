@@ -289,7 +289,7 @@ style = { [styles.dot, row === 2 && col === 2 && styles.dotCenter]}
     <View style={ styles.scanlines } pointerEvents = "none" />
     {
         doomFrameUri?(
-            <Image 
+            <Image
               source = {{ uri: doomFrameUri }}
 style = { styles.webview }
 resizeMode = "stretch"
