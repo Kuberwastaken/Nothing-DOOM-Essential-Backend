@@ -1,0 +1,460 @@
+import React, { useRef, useState, useEffect } from 'react';
+import { View, Text, StyleSheet, Pressable, Animated, Image } from 'react-native';
+import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler';
+import { tokens } from './src/styles/tokens';
+import { doomWasmBase64 } from './doom.wasm.js';
+
+// Base64 decoding utilities
+function decodeBase64(base64: string): Uint8Array {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const lookup = new Uint8Array(256);
+    for (let i = 0; i < chars.length; i++) {
+        lookup[chars.charCodeAt(i)] = i;
+    }
+    let bufferLength = base64.length * 0.75;
+    if (base64[base64.length - 1] === '=') bufferLength--;
+    if (base64[base64.length - 2] === '=') bufferLength--;
+
+    const bytes = new Uint8Array(bufferLength);
+    let p = 0;
+    for (let i = 0; i < base64.length; i += 4) {
+        let encoded1 = lookup[base64.charCodeAt(i)];
+        let encoded2 = lookup[base64.charCodeAt(i + 1)];
+        let encoded3 = lookup[base64.charCodeAt(i + 2)];
+        let encoded4 = lookup[base64.charCodeAt(i + 3)];
+
+        bytes[p++] = (encoded1 << 2) | (encoded2 >> 4);
+        if (base64[i + 2] !== '=') bytes[p++] = ((encoded2 & 15) << 4) | (encoded3 >> 2);
+        if (base64[i + 3] !== '=') bytes[p++] = ((encoded3 & 3) << 6) | (encoded4 & 63);
+    }
+    return bytes;
+}
+
+const b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function fastB64Encode(bytes: Uint8Array): string {
+    let res = '';
+    const len = bytes.length;
+    const rem = len % 3;
+    const max = len - rem;
+    for (let i = 0; i < max; i += 3) {
+        res += b64chars[bytes[i] >> 2] +
+            b64chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)] +
+            b64chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)] +
+            b64chars[bytes[i + 2] & 63];
+    }
+    if (rem === 1) {
+        res += b64chars[bytes[max] >> 2] + b64chars[(bytes[max] & 3) << 4] + '==';
+    } else if (rem === 2) {
+        res += b64chars[bytes[max] >> 2] +
+            b64chars[((bytes[max] & 3) << 4) | (bytes[max + 1] >> 4)] +
+            b64chars[(bytes[max + 1] & 15) << 2] + '=';
+    }
+    return res;
+}
+
+function readModuleMemoryAsUtf8String(moduleMemory: any, offsetIntoMemory: number, stringByteLength: number) {
+    const buffer8 = new Uint8Array(moduleMemory.buffer);
+    const data = buffer8.slice(offsetIntoMemory, offsetIntoMemory + stringByteLength);
+    let str = '';
+    for (let i = 0; i < data.length; i++) {
+        str += String.fromCharCode(data[i]);
+    }
+    return str;
+}
+
+const JOYSTICK_SIZE = 72;
+const JOYSTICK_KNOB_SIZE = 28;
+const JOYSTICK_RANGE = 20;
+
+export default function App() {
+    const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set());
+    const [doomFrameUri, setDoomFrameUri] = useState<string | null>(null);
+
+    const joystickX = useRef(new Animated.Value(0)).current;
+    const joystickY = useRef(new Animated.Value(0)).current;
+    const activeDirections = useRef<Set<string>>(new Set());
+
+    // Refs for the WASM instance
+    const doomInstanceRef = useRef<any>(null);
+    const tickIntervalRef = useRef<any>(null);
+
+    useEffect(() => {
+        let isDestroyed = false;
+
+        // We'll prepare the BMP buffer once
+        const WIDTH = 320;
+        const HEIGHT = 200;
+        const PIXEL_DATA_SIZE = WIDTH * HEIGHT * 4;
+        const bmpBuffer = new Uint8Array(54 + PIXEL_DATA_SIZE);
+
+        // Set up standard 54-byte BMP header
+        const bmpView = new DataView(bmpBuffer.buffer);
+        bmpView.setUint16(0, 0x4D42, false);   // 'BM'
+        bmpView.setUint32(2, bmpBuffer.length, true);
+        bmpView.setUint32(10, 54, true);       // Offset
+        bmpView.setUint32(14, 40, true);       // DIB Header size
+        bmpView.setUint32(18, WIDTH, true);
+        bmpView.setInt32(22, -HEIGHT, true);   // Top-Down rendering
+        bmpView.setUint16(26, 1, true);        // Color Planes
+        bmpView.setUint16(28, 32, true);       // 32-bit BGRA
+        bmpView.setUint32(30, 0, true);        // Compression = none
+
+        let moduleInstanceMemory: any = null;
+
+        const imports = {
+            loading: {
+                onGameInit: (width: number, height: number) => { },
+                wadSizes: () => { },
+                readWads: () => { },
+            },
+            ui: {
+                drawFrame: (indexOfFrameBuffer: number) => {
+                    if (isDestroyed || !moduleInstanceMemory) return;
+                    const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, PIXEL_DATA_SIZE);
+
+                    // Fast-copy DOOM's BGRA pixel buffer directly into our BMP buffer right after the 54-byte header!
+                    bmpBuffer.set(doomPixels, 54);
+
+                    // Fast convert to Base64
+                    const base64Str = fastB64Encode(bmpBuffer);
+                    setDoomFrameUri(`data:image/bmp;base64,${base64Str}`);
+                },
+            },
+            runtimeControl: {
+                timeInMilliseconds: () => BigInt(Math.trunc(Date.now())),
+            },
+            console: {
+                onInfoMessage: (messagePtr: number, length: number) => {
+                    console.log('[Doom stdout]', readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
+                },
+                onErrorMessage: (messagePtr: number, length: number) => {
+                    console.error('[Doom stderr]', readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
+                },
+            },
+            gameSaving: {
+                sizeOfSaveGame: () => 0,
+                readSaveGame: () => 0,
+                writeSaveGame: () => 0,
+            },
+        };
+
+        async function initDoom() {
+            try {
+                const wasmBytes = decodeBase64(doomWasmBase64);
+                const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
+                if (isDestroyed) return;
+
+                moduleInstanceMemory = instance.exports.memory;
+                doomInstanceRef.current = instance.exports;
+
+                instance.exports.initGame();
+                tickIntervalRef.current = setInterval(instance.exports.tickGame, 1000 / 35);
+            } catch (err) {
+                console.error('Failed to init DOOM:', err);
+            }
+        }
+
+        initDoom();
+
+        return () => {
+            isDestroyed = true;
+            if (tickIntervalRef.current) clearInterval(tickIntervalRef.current);
+        };
+    }, []);
+
+    const resolveDoomKey = (key: string) => {
+        if (!doomInstanceRef.current) return null;
+        const exports = doomInstanceRef.current;
+        const map: Record<string, number> = {
+            ArrowLeft: exports.KEY_LEFTARROW,
+            ArrowRight: exports.KEY_RIGHTARROW,
+            ArrowUp: exports.KEY_UPARROW,
+            ArrowDown: exports.KEY_DOWNARROW,
+            ',': exports.KEY_STRAFE_L,
+            '.': exports.KEY_STRAFE_R,
+            'Control': exports.KEY_FIRE,
+            ' ': exports.KEY_USE,
+            'Shift': exports.KEY_SHIFT,
+            'Tab': exports.KEY_TAB,
+            'Escape': exports.KEY_ESCAPE,
+            'Enter': exports.KEY_ENTER,
+            'Backspace': exports.KEY_BACKSPACE,
+            'Alt': exports.KEY_ALT,
+        };
+        if (map[key] !== undefined) return map[key];
+        if (key.length === 1) return key.charCodeAt(0);
+        return null;
+    };
+
+    const keyDown = (key: string) => {
+        if (activeKeys.has(key)) return;
+        setActiveKeys(prev => new Set(prev).add(key));
+        const doomKey = resolveDoomKey(key);
+        if (doomKey !== null) doomInstanceRef.current?.reportKeyDown(doomKey);
+    };
+
+    const keyUp = (key: string) => {
+        setActiveKeys(prev => {
+            const next = new Set(prev);
+            next.delete(key);
+            return next;
+        });
+        const doomKey = resolveDoomKey(key);
+        if (doomKey !== null) doomInstanceRef.current?.reportKeyUp(doomKey);
+    };
+
+    const joystickPan = Gesture.Pan()
+        .runOnJS(true)
+        .onUpdate((e) => {
+            const clampedX = Math.max(-JOYSTICK_RANGE, Math.min(JOYSTICK_RANGE, e.translationX));
+            const clampedY = Math.max(-JOYSTICK_RANGE, Math.min(JOYSTICK_RANGE, e.translationY));
+            joystickX.setValue(clampedX);
+            joystickY.setValue(clampedY);
+
+            const threshold = 7;
+            const newDirs = new Set<string>();
+
+            if (clampedY < -threshold) newDirs.add('ArrowUp');
+            if (clampedY > threshold) newDirs.add('ArrowDown');
+            if (clampedX < -threshold) newDirs.add('ArrowLeft');
+            if (clampedX > threshold) newDirs.add('ArrowRight');
+
+            activeDirections.current.forEach(dir => {
+                if (!newDirs.has(dir)) keyUp(dir);
+            });
+            newDirs.forEach(dir => {
+                if (!activeDirections.current.has(dir)) keyDown(dir);
+            });
+
+            activeDirections.current = newDirs;
+        })
+        .onEnd(() => {
+            Animated.spring(joystickX, { toValue: 0, useNativeDriver: false, tension: 120, friction: 10 }).start();
+            Animated.spring(joystickY, { toValue: 0, useNativeDriver: false, tension: 120, friction: 10 }).start();
+            activeDirections.current.forEach(dir => keyUp(dir));
+            activeDirections.current.clear();
+        });
+
+    const ActionButton = ({ label, doomKey, flex, red }: { label: string; doomKey: string; flex?: number; red?: boolean; }) => (
+        <Pressable
+      style= {({ pressed }) => [
+        styles.actionBtn,
+        flex ? { flex } : {},
+        (pressed || activeKeys.has(doomKey)) && (red ? styles.actionBtnActiveRed : styles.actionBtnActive),
+    ]
+}
+onPressIn = {() => keyDown(doomKey)}
+onPressOut = {() => keyUp(doomKey)}
+    >
+    <Text style={ styles.actionBtnText }> { label } </Text>
+        </Pressable>
+  );
+
+return (
+    <GestureHandlerRootView style= { styles.root } >
+    <View style={ styles.container }>
+
+        {/* ── LEFT: Joystick + Strafe ── */ }
+        < View style = { styles.leftPanel } >
+            <View style={ styles.strafeRow }>
+                <ActionButton label="◄" doomKey = "," />
+                    <ActionButton label="►" doomKey = "." />
+                        </View>
+
+                        < GestureDetector gesture = { joystickPan } >
+                            <View style={ styles.joystickBase }>
+                            {
+                                [0, 1, 2, 3, 4].map(row => [0, 1, 2, 3, 4].map(col => (
+                                    <View
+                  key= {`${row}-${col}`}
+style = { [styles.dot, row === 2 && col === 2 && styles.dotCenter]}
+    />
+              )))}
+<Animated.View
+                style={
+    [
+        styles.joystickKnob,
+        { transform: [{ translateX: joystickX }, { translateY: joystickY }] },
+    ]
+}
+              />
+    </View>
+    </GestureDetector>
+
+    < Text style = { styles.label } > MOVE </Text>
+        </View>
+
+{/* ── CENTER: Game ── */ }
+<View style={ styles.gameContainer }>
+    <View style={ styles.scanlines } pointerEvents = "none" />
+    {
+        doomFrameUri?(
+            <Image 
+              source = {{ uri: doomFrameUri }}
+style = { styles.webview }
+resizeMode = "stretch"
+fadeDuration = { 0}
+    />
+          ) : (
+    <View style= {{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#000' }}>
+        <Text style={ { color: '#555', fontSize: 10, fontWeight: 'bold' } }> LOADING DOOM...</Text>
+            </View>
+          )}
+<View style={ styles.cornerTag }>
+    <Text style={ styles.cornerTagText }> DOOM </Text>
+        </View>
+        </View>
+
+{/* ── RIGHT: Action buttons ── */ }
+<View style={ styles.rightPanel }>
+    <ActionButton label="FIRE" doomKey = "Control" flex = { 1} red />
+        <ActionButton label="USE" doomKey = " " flex = { 1} />
+            <View style={ styles.smallBtnsRow }>
+                <ActionButton label="ESC" doomKey = "Escape" />
+                    <ActionButton label="↵" doomKey = "Enter" />
+                        </View>
+                        </View>
+
+                        </View>
+                        </GestureHandlerRootView>
+  );
+}
+
+const styles = StyleSheet.create({
+    root: {
+        flex: 1,
+    },
+    container: {
+        flex: 1,
+        flexDirection: 'row',
+        backgroundColor: tokens.colors.dark || '#1a1a1a',
+        borderRadius: 22,
+        overflow: 'hidden',
+        padding: 10,
+        gap: 8,
+    },
+
+    // ── Left panel ──
+    leftPanel: {
+        width: 76,
+        alignItems: 'center',
+        justifyContent: 'flex-end',
+        gap: 6,
+        paddingBottom: 2,
+    },
+    strafeRow: {
+        flexDirection: 'row',
+        gap: 4,
+    },
+    joystickBase: {
+        width: JOYSTICK_SIZE,
+        height: JOYSTICK_SIZE,
+        borderRadius: JOYSTICK_SIZE / 2,
+        backgroundColor: tokens.colors['secondary-dark'] || '#333',
+        justifyContent: 'center',
+        alignItems: 'center',
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        padding: 10,
+        gap: 3,
+    },
+    dot: {
+        width: 3,
+        height: 3,
+        borderRadius: 1.5,
+        backgroundColor: tokens.colors['secondary-light'] || '#aaa',
+        opacity: 0.35,
+    },
+    dotCenter: {
+        backgroundColor: tokens.colors.light || '#fff',
+        opacity: 0.7,
+    },
+    joystickKnob: {
+        position: 'absolute',
+        width: JOYSTICK_KNOB_SIZE,
+        height: JOYSTICK_KNOB_SIZE,
+        borderRadius: JOYSTICK_KNOB_SIZE / 2,
+        backgroundColor: tokens.colors.light || '#fff',
+        shadowColor: '#fff',
+        shadowOpacity: 0.2,
+        shadowRadius: 4,
+    },
+    label: {
+        fontSize: 8,
+        fontWeight: '700',
+        color: tokens.colors['secondary-light'] || '#aaa',
+        letterSpacing: 1.5,
+        opacity: 0.5,
+    },
+
+    // ── Game ──
+    gameContainer: {
+        flex: 1,
+        borderRadius: 10,
+        overflow: 'hidden',
+        backgroundColor: '#000',
+    },
+    webview: {
+        flex: 1,
+        backgroundColor: '#000',
+    },
+    scanlines: {
+        position: 'absolute',
+        inset: 0,
+        zIndex: 10,
+        opacity: 0.04,
+        backgroundColor: 'transparent',
+        backgroundImage: 'repeating-linear-gradient(0deg, #000 0px, #000 1px, transparent 1px, transparent 2px)',
+    },
+    cornerTag: {
+        position: 'absolute',
+        top: 6,
+        right: 6,
+        zIndex: 20,
+        backgroundColor: 'rgba(0,0,0,0.6)',
+        paddingHorizontal: 5,
+        paddingVertical: 2,
+        borderRadius: 3,
+        borderWidth: 1,
+        borderColor: '#D81921',
+    },
+    cornerTagText: {
+        color: '#D81921',
+        fontSize: 7,
+        fontWeight: '900',
+        letterSpacing: 2,
+    },
+
+    // ── Right panel ──
+    rightPanel: {
+        width: 62,
+        gap: 5,
+        justifyContent: 'flex-end',
+        paddingBottom: 2,
+    },
+    actionBtn: {
+        backgroundColor: tokens.colors['secondary-dark'] || '#333',
+        borderRadius: 8,
+        justifyContent: 'center',
+        alignItems: 'center',
+        paddingVertical: 6,
+        paddingHorizontal: 4,
+        minHeight: 28,
+    },
+    actionBtnActive: {
+        backgroundColor: tokens.colors.light || '#fff',
+    },
+    actionBtnActiveRed: {
+        backgroundColor: '#D81921',
+    },
+    actionBtnText: {
+        color: tokens.colors.light || '#fff',
+        fontSize: 9,
+        fontWeight: '800',
+        letterSpacing: 0.8,
+    },
+    smallBtnsRow: {
+        flexDirection: 'row',
+        gap: 4,
+    },
+});
