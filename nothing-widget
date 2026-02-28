@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { View, Text, StyleSheet, Pressable, Animated, Image, SafeAreaView } from 'react-native';
+import { View, Text, StyleSheet, Pressable, Animated, Image, SafeAreaView, ScrollView } from 'react-native';
 import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { tokens } from './src/styles/tokens';
 
@@ -45,21 +45,23 @@ export default function App() {
     const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set());
     const [doomFrameUri, setDoomFrameUri] = useState<string | null>(null);
     const [statusMessage, setStatusMessage] = useState<string>('STARTING...');
-
-    // We will now store ALL logs, not just the last 9.
     const [devLogs, setDevLogs] = useState<string[]>([]);
 
-    // Track where we are scrolled to in the log history
-    const [logScrollOffset, setLogScrollOffset] = useState<number>(0);
+    const logScrollRef = useRef<ScrollView>(null);
 
     const addLog = (msg: string) => {
         setDevLogs(prev => {
             const next = [...prev, msg];
-            // keep up to 100 logs just so memory doesn't explode 
             if (next.length > 100) return next.slice(-100);
             return next;
         });
     };
+
+    useEffect(() => {
+        if (logScrollRef.current) {
+            logScrollRef.current.scrollToEnd({ animated: true });
+        }
+    }, [devLogs]);
 
     const frameCountRef = useRef<number>(0);
     const joystickX = useRef(new Animated.Value(0)).current;
@@ -74,6 +76,8 @@ export default function App() {
 
         let CURRENT_WIDTH = 0;
         let CURRENT_HEIGHT = 0;
+        let WASM_WIDTH = 0;
+        let WASM_HEIGHT = 0;
         let PIXEL_DATA_SIZE = 0;
         let bmpBuffer: Uint8Array | null = null;
         let moduleInstanceMemory: any = null;
@@ -82,9 +86,14 @@ export default function App() {
             loading: {
                 onGameInit: (width: number, height: number) => {
                     addLog(`Game Init: ${width}x${height}`);
-                    CURRENT_WIDTH = width;
-                    CURRENT_HEIGHT = height;
-                    PIXEL_DATA_SIZE = width * height * 4;
+
+                    WASM_WIDTH = width;
+                    WASM_HEIGHT = height;
+                    CURRENT_WIDTH = Math.floor(width / 2);
+                    CURRENT_HEIGHT = Math.floor(height / 2);
+
+                    // Downscale to 24-bit to completely avoid invisible Alpha channels natively
+                    PIXEL_DATA_SIZE = CURRENT_WIDTH * CURRENT_HEIGHT * 3;
 
                     bmpBuffer = new Uint8Array(54 + PIXEL_DATA_SIZE);
                     const bmpView = new DataView(bmpBuffer.buffer);
@@ -94,9 +103,9 @@ export default function App() {
                     bmpView.setUint32(10, 54, true);
                     bmpView.setUint32(14, 40, true);
                     bmpView.setUint32(18, CURRENT_WIDTH, true);
-                    bmpView.setInt32(22, CURRENT_HEIGHT, true); // Positive ensures Bottom-Up BMP, supported natively everywhere
+                    bmpView.setInt32(22, -CURRENT_HEIGHT, true); // Stick with Top-Down for JS array bounds correlation
                     bmpView.setUint16(26, 1, true);
-                    bmpView.setUint16(28, 32, true);
+                    bmpView.setUint16(28, 24, true); // Force 24-bit BGR format
                     bmpView.setUint32(30, 0, true);
                 },
                 wadSizes: () => { },
@@ -107,28 +116,37 @@ export default function App() {
                     if (isDestroyed || !moduleInstanceMemory || !bmpBuffer) return;
                     try {
                         if (frameCountRef.current === 0) addLog('DRAWN FIRST FRAME!');
-                        if (frameCountRef.current === 35) addLog('DRAWN 35 FRAMES!');
+                        if (frameCountRef.current % 35 === 0) addLog(`DRAWN ${frameCountRef.current} FRAMES!`);
 
-                        // MASSIVE JS THREAD SAVER:
-                        // WebAssembly generates frames at 35 FPS. 640x400x4 Base64 string is ~1.4MB.
-                        // 1.4MB * 35 = ~50 Megabytes/second pushed over the React Native old architecture JSON bridge!
-                        // This completely locks the Javascript thread and prevents the UI from actually drawing the string.
-                        // We will intentionally drop 5 out of 6 frames, rendering at ~5.8 FPS on the UI thread to un-choke the device.
-                        if (frameCountRef.current % 6 !== 0) {
+                        // Run at 17 FPS now that payload is 80% smaller
+                        if (frameCountRef.current % 2 !== 0) {
                             frameCountRef.current++;
                             return;
                         }
 
                         frameCountRef.current++;
 
-                        // Bounds check gracefully
-                        if (moduleInstanceMemory.buffer.byteLength < indexOfFrameBuffer + PIXEL_DATA_SIZE) {
+                        const srcBytesRequired = WASM_WIDTH * WASM_HEIGHT * 4;
+                        if (moduleInstanceMemory.buffer.byteLength < indexOfFrameBuffer + srcBytesRequired) {
                             if (frameCountRef.current < 5) addLog('CRASH: Memory Underflow!');
                             return;
                         }
 
-                        const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, PIXEL_DATA_SIZE);
-                        bmpBuffer.set(doomPixels, 54);
+                        const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, srcBytesRequired);
+
+                        // Copy out pixels at 50% scale, converting RGBA to BGR
+                        let destOffset = 54;
+                        for (let y = 0; y < CURRENT_HEIGHT; y++) {
+                            const srcY = y * 2;
+                            let srcRowOffset = srcY * WASM_WIDTH * 4;
+                            for (let x = 0; x < CURRENT_WIDTH; x++) {
+                                let srcOffset = srcRowOffset + (x * 2 * 4);
+                                bmpBuffer[destOffset++] = doomPixels[srcOffset + 2]; // B
+                                bmpBuffer[destOffset++] = doomPixels[srcOffset + 1]; // G
+                                bmpBuffer[destOffset++] = doomPixels[srcOffset + 0]; // R
+                            }
+                        }
+
                         const base64Str = fastB64Encode(bmpBuffer);
                         setDoomFrameUri(`data:image/bmp;base64,${base64Str}`);
                     } catch (e: any) {
@@ -141,7 +159,6 @@ export default function App() {
             },
             console: {
                 onInfoMessage: (messagePtr: number, length: number) => {
-                    // addLog('[WASM] ' + readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
                 },
                 onErrorMessage: (messagePtr: number, length: number) => {
                     addLog('[WASM ERR] ' + readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
@@ -272,21 +289,12 @@ export default function App() {
             if (clampedX < -threshold) newDirs.add('ArrowLeft');
             if (clampedX > threshold) newDirs.add('ArrowRight');
 
-            // If game has NOT rendered yet, hijack joystick to scroll logs
-            if (!doomFrameUri) {
-                if (clampedY < -threshold) {
-                    setLogScrollOffset(prev => Math.min(prev + 1, devLogs.length > 9 ? devLogs.length - 9 : 0));
-                } else if (clampedY > threshold) {
-                    setLogScrollOffset(prev => Math.max(prev - 1, 0));
-                }
-            } else {
-                activeDirections.current.forEach(dir => {
-                    if (!newDirs.has(dir)) keyUp(dir);
-                });
-                newDirs.forEach(dir => {
-                    if (!activeDirections.current.has(dir)) keyDown(dir);
-                });
-            }
+            activeDirections.current.forEach(dir => {
+                if (!newDirs.has(dir)) keyUp(dir);
+            });
+            newDirs.forEach(dir => {
+                if (!activeDirections.current.has(dir)) keyDown(dir);
+            });
 
             activeDirections.current = newDirs;
         })
@@ -299,7 +307,7 @@ export default function App() {
 
     const ActionButton = ({ label, doomKey, flex, red }: { label: string; doomKey: string; flex?: number; red?: boolean; }) => (
         <Pressable
-      style= {({ pressed }) => [
+            style= {({ pressed }) => [
         styles.actionBtn,
         flex ? { flex } : {},
         (pressed || activeKeys.has(doomKey)) && (red ? styles.actionBtnActiveRed : styles.actionBtnActive),
@@ -307,18 +315,17 @@ export default function App() {
 }
 onPressIn = {() => keyDown(doomKey)}
 onPressOut = {() => keyUp(doomKey)}
-    >
+        >
     <Text style={ styles.actionBtnText }> { label } </Text>
         </Pressable>
-  );
+    );
 
 return (
     <SafeAreaView style= {{ flex: 1, backgroundColor: '#000' }}>
         <GestureHandlerRootView style={ styles.root }>
             <View style={ styles.container }>
 
-                {/* ── LEFT: Joystick + Strafe ── */ }
-                < View style = { styles.leftPanel } >
+                <View style={ styles.leftPanel }>
                     <View style={ styles.strafeRow }>
                         <ActionButton label="◄" doomKey = "," />
                             <ActionButton label="►" doomKey = "." />
@@ -329,49 +336,59 @@ return (
                                     {
                                         [0, 1, 2, 3, 4].map(row => [0, 1, 2, 3, 4].map(col => (
                                             <View
-                    key= {`${row}-${col}`}
+                                        key= {`${row}-${col}`}
 style = { [styles.dot, row === 2 && col === 2 && styles.dotCenter]}
     />
-                )))}
+                                )))}
 <Animated.View
-                  style={
+                                    style={
     [
         styles.joystickKnob,
         { transform: [{ translateX: joystickX }, { translateY: joystickY }] },
     ]
 }
-                />
+                                />
     </View>
     </GestureDetector>
 
     < Text style = { styles.label } > MOVE </Text>
         </View>
 
-{/* ── CENTER: Game / Logs ── */ }
-<View style={ styles.gameContainer }>
-    <View style={ styles.scanlines } pointerEvents = "none" />
+        < View style = { styles.gameContainer } >
+            <View style={ styles.scanlines } pointerEvents = "none" />
 
-    {
-        doomFrameUri?(
-              <Image
-                source = {{ uri: doomFrameUri }}
+            {
+                doomFrameUri?(
+                            <Image
+                                source = {{ uri: doomFrameUri }}
 style = { [styles.webview, { transform: [{ scaleY: -1 }] }]}
 resizeMode = "stretch"
 fadeDuration = { 0}
     />
-            ) : (
+                        ) : (
     <View style= {{ flex: 1, backgroundColor: '#111' }} />
-            )}
+                        )}
 
-{/* ALWAYS KEEP LOGS OVERLAY VISIBLE */ }
-<View style={ { position: 'absolute', top: 10, left: 10, zIndex: 100 } } pointerEvents = "none" >
-    <Text style={ { color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 5 } }> [WASM ENGINE STATUS] </Text>
+<View style={ styles.logContainer } pointerEvents = "box-none" >
+    <Text style={ styles.logHeader }> [WASM ENGINE STATUS] </Text>
+        < ScrollView
+ref = { logScrollRef }
+style = { styles.logScrollView }
+contentContainerStyle = { styles.logContent }
+showsVerticalScrollIndicator = { true}
+persistentScrollbar = { true}
+    >
 {
-    // Slice using the offset to allow scrolling up (max 9 items shown)
-    devLogs.slice(Math.max(0, devLogs.length - 9 - logScrollOffset), devLogs.length - logScrollOffset).map((log, i) => (
-        <Text key= { `${i}-${logScrollOffset}` } style = {{ color: '#0f0', fontSize: 10, fontFamily: 'monospace', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 1 }}> { '>'} { log } </Text>
-              ))}
-{ statusMessage ? <Text style={ { color: 'red', fontSize: 14, marginTop: 10, fontWeight: 'bold', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 1 } }> !!{ statusMessage }!! </Text> : null }
+    devLogs.map((log, i) => (
+        <Text key= { i } style = { styles.logText } > { '>'} { log } </Text>
+    ))
+}
+    </ScrollView>
+{
+    statusMessage ? (
+        <Text style= { styles.statusText } > !!{ statusMessage }!! </Text>
+                            ) : null
+}
 </View>
 
     < View style = { styles.cornerTag } >
@@ -379,20 +396,19 @@ fadeDuration = { 0}
             </View>
             </View>
 
-{/* ── RIGHT: Action buttons ── */ }
-<View style={ styles.rightPanel }>
-    <ActionButton label="FIRE" doomKey = "Control" flex = { 1} red />
-        <ActionButton label="USE" doomKey = " " flex = { 1} />
-            <View style={ styles.smallBtnsRow }>
-                <ActionButton label="ESC" doomKey = "Escape" />
-                    <ActionButton label="↵" doomKey = "Enter" />
-                        </View>
-                        </View>
+            < View style = { styles.rightPanel } >
+                <ActionButton label="FIRE" doomKey = "Control" flex = { 1} red />
+                    <ActionButton label="USE" doomKey = " " flex = { 1} />
+                        <View style={ styles.smallBtnsRow }>
+                            <ActionButton label="ESC" doomKey = "Escape" />
+                                <ActionButton label="↵" doomKey = "Enter" />
+                                    </View>
+                                    </View>
 
-                        </View>
-                        </GestureHandlerRootView>
-                        </SafeAreaView>
-  );
+                                    </View>
+                                    </GestureHandlerRootView>
+                                    </SafeAreaView>
+    );
 }
 
 const styles = StyleSheet.create({
@@ -478,6 +494,47 @@ const styles = StyleSheet.create({
         opacity: 0.04,
         backgroundColor: 'transparent',
         backgroundImage: 'repeating-linear-gradient(0deg, #000 0px, #000 1px, transparent 1px, transparent 2px)',
+    },
+    logContainer: {
+        position: 'absolute',
+        top: 10,
+        left: 10,
+        zIndex: 100,
+        maxWidth: 160,
+        maxHeight: 120,
+    },
+    logHeader: {
+        color: '#fff',
+        fontSize: 13,
+        fontWeight: 'bold',
+        marginBottom: 5,
+    },
+    logScrollView: {
+        maxHeight: 90,
+        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        borderRadius: 4,
+        paddingHorizontal: 4,
+    },
+    logContent: {
+        paddingVertical: 4,
+    },
+    logText: {
+        color: '#0f0',
+        fontSize: 10,
+        fontFamily: 'monospace',
+        textShadowColor: '#000',
+        textShadowOffset: { width: 1, height: 1 },
+        textShadowRadius: 1,
+        lineHeight: 12,
+    },
+    statusText: {
+        color: 'red',
+        fontSize: 14,
+        marginTop: 6,
+        fontWeight: 'bold',
+        textShadowColor: '#000',
+        textShadowOffset: { width: 1, height: 1 },
+        textShadowRadius: 1,
     },
     cornerTag: {
         position: 'absolute',
