@@ -45,9 +45,21 @@ export default function App() {
     const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set());
     const [doomFrameUri, setDoomFrameUri] = useState<string | null>(null);
     const [statusMessage, setStatusMessage] = useState<string>('STARTING...');
+
+    // We will now store ALL logs, not just the last 9.
     const [devLogs, setDevLogs] = useState<string[]>([]);
 
-    const addLog = (msg: string) => setDevLogs(prev => [...prev.slice(-9), msg]);
+    // Track where we are scrolled to in the log history
+    const [logScrollOffset, setLogScrollOffset] = useState<number>(0);
+
+    const addLog = (msg: string) => {
+        setDevLogs(prev => {
+            const next = [...prev, msg];
+            // keep up to 100 logs just so memory doesn't explode 
+            if (next.length > 100) return next.slice(-100);
+            return next;
+        });
+    };
 
     const frameCountRef = useRef<number>(0);
     const joystickX = useRef(new Animated.Value(0)).current;
@@ -82,7 +94,7 @@ export default function App() {
                     bmpView.setUint32(10, 54, true);
                     bmpView.setUint32(14, 40, true);
                     bmpView.setUint32(18, CURRENT_WIDTH, true);
-                    bmpView.setInt32(22, -CURRENT_HEIGHT, true);
+                    bmpView.setInt32(22, CURRENT_HEIGHT, true); // Positive ensures Bottom-Up BMP, supported natively everywhere
                     bmpView.setUint16(26, 1, true);
                     bmpView.setUint16(28, 32, true);
                     bmpView.setUint32(30, 0, true);
@@ -96,6 +108,17 @@ export default function App() {
                     try {
                         if (frameCountRef.current === 0) addLog('DRAWN FIRST FRAME!');
                         if (frameCountRef.current === 35) addLog('DRAWN 35 FRAMES!');
+
+                        // MASSIVE JS THREAD SAVER:
+                        // WebAssembly generates frames at 35 FPS. 640x400x4 Base64 string is ~1.4MB.
+                        // 1.4MB * 35 = ~50 Megabytes/second pushed over the React Native old architecture JSON bridge!
+                        // This completely locks the Javascript thread and prevents the UI from actually drawing the string.
+                        // We will intentionally drop 5 out of 6 frames, rendering at ~5.8 FPS on the UI thread to un-choke the device.
+                        if (frameCountRef.current % 6 !== 0) {
+                            frameCountRef.current++;
+                            return;
+                        }
+
                         frameCountRef.current++;
 
                         // Bounds check gracefully
@@ -249,12 +272,21 @@ export default function App() {
             if (clampedX < -threshold) newDirs.add('ArrowLeft');
             if (clampedX > threshold) newDirs.add('ArrowRight');
 
-            activeDirections.current.forEach(dir => {
-                if (!newDirs.has(dir)) keyUp(dir);
-            });
-            newDirs.forEach(dir => {
-                if (!activeDirections.current.has(dir)) keyDown(dir);
-            });
+            // If game has NOT rendered yet, hijack joystick to scroll logs
+            if (!doomFrameUri) {
+                if (clampedY < -threshold) {
+                    setLogScrollOffset(prev => Math.min(prev + 1, devLogs.length > 9 ? devLogs.length - 9 : 0));
+                } else if (clampedY > threshold) {
+                    setLogScrollOffset(prev => Math.max(prev - 1, 0));
+                }
+            } else {
+                activeDirections.current.forEach(dir => {
+                    if (!newDirs.has(dir)) keyUp(dir);
+                });
+                newDirs.forEach(dir => {
+                    if (!activeDirections.current.has(dir)) keyDown(dir);
+                });
+            }
 
             activeDirections.current = newDirs;
         })
@@ -323,7 +355,7 @@ style = { [styles.dot, row === 2 && col === 2 && styles.dotCenter]}
         doomFrameUri?(
               <Image
                 source = {{ uri: doomFrameUri }}
-style = { styles.webview }
+style = { [styles.webview, { transform: [{ scaleY: -1 }] }]}
 resizeMode = "stretch"
 fadeDuration = { 0}
     />
@@ -335,8 +367,9 @@ fadeDuration = { 0}
 <View style={ { position: 'absolute', top: 10, left: 10, zIndex: 100 } } pointerEvents = "none" >
     <Text style={ { color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 5 } }> [WASM ENGINE STATUS] </Text>
 {
-    devLogs.map((log, i) => (
-        <Text key= { i } style = {{ color: '#0f0', fontSize: 10, fontFamily: 'monospace', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 1 }}> { '>'} { log } </Text>
+    // Slice using the offset to allow scrolling up (max 9 items shown)
+    devLogs.slice(Math.max(0, devLogs.length - 9 - logScrollOffset), devLogs.length - logScrollOffset).map((log, i) => (
+        <Text key= { `${i}-${logScrollOffset}` } style = {{ color: '#0f0', fontSize: 10, fontFamily: 'monospace', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 1 }}> { '>'} { log } </Text>
               ))}
 { statusMessage ? <Text style={ { color: 'red', fontSize: 14, marginTop: 10, fontWeight: 'bold', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 1 } }> !!{ statusMessage }!! </Text> : null }
 </View>
