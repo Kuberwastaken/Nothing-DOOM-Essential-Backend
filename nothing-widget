@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { View, Text, StyleSheet, Pressable, Animated, Image } from 'react-native';
+import { View, Text, StyleSheet, Pressable, Animated, Image, ScrollView, SafeAreaView } from 'react-native';
 import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { tokens } from './src/styles/tokens';
 
@@ -44,7 +44,10 @@ const JOYSTICK_RANGE = 20;
 export default function App() {
     const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set());
     const [doomFrameUri, setDoomFrameUri] = useState<string | null>(null);
-    const [statusMessage, setStatusMessage] = useState<string>('FETCHING ENGINE...');
+    const [statusMessage, setStatusMessage] = useState<string>('STARTING...');
+    const [devLogs, setDevLogs] = useState<string[]>([]);
+
+    const addLog = (msg: string) => setDevLogs(prev => [...prev.slice(-9), msg]);
 
     const joystickX = useRef(new Animated.Value(0)).current;
     const joystickY = useRef(new Animated.Value(0)).current;
@@ -76,17 +79,23 @@ export default function App() {
 
         const imports = {
             loading: {
-                onGameInit: (width: number, height: number) => { },
+                onGameInit: (width: number, height: number) => {
+                    addLog(`Game Init: ${width}x${height}`);
+                },
                 wadSizes: () => { },
                 readWads: () => { },
             },
             ui: {
                 drawFrame: (indexOfFrameBuffer: number) => {
                     if (isDestroyed || !moduleInstanceMemory) return;
-                    const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, PIXEL_DATA_SIZE);
-                    bmpBuffer.set(doomPixels, 54);
-                    const base64Str = fastB64Encode(bmpBuffer);
-                    setDoomFrameUri(`data:image/bmp;base64,${base64Str}`);
+                    try {
+                        const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, PIXEL_DATA_SIZE);
+                        bmpBuffer.set(doomPixels, 54);
+                        const base64Str = fastB64Encode(bmpBuffer);
+                        setDoomFrameUri(`data:image/bmp;base64,${base64Str}`);
+                    } catch (e: any) {
+                        console.error(e);
+                    }
                 },
             },
             runtimeControl: {
@@ -94,10 +103,10 @@ export default function App() {
             },
             console: {
                 onInfoMessage: (messagePtr: number, length: number) => {
-                    console.log('[Doom stdout]', readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
+                    // addLog('[WASM] ' + readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
                 },
                 onErrorMessage: (messagePtr: number, length: number) => {
-                    console.error('[Doom stderr]', readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
+                    addLog('[WASM ERR] ' + readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
                 },
             },
             gameSaving: {
@@ -109,36 +118,54 @@ export default function App() {
 
         async function initDoom() {
             try {
+                addLog('1. Fetching URL...');
+                setStatusMessage('DOWNLOADING ENGINE...');
+
+                if (typeof WebAssembly === 'undefined') {
+                    throw new Error('WebAssembly global object is UNDEFINED. Current Javascript engine (Hermes?) does not support compilation.');
+                }
+
                 const response = await fetch(REMOTE_WASM_URL);
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-                setStatusMessage('COMPILING WASM...');
+                addLog('2. Getting array buffer...');
                 const wasmBytes = await response.arrayBuffer();
+                addLog(`Buffer bytes: ${wasmBytes.byteLength}`);
 
-                const { instance } = await WebAssembly.instantiate(wasmBytes, imports);
+                setStatusMessage('COMPILING WASM...');
+                addLog('3. WebAssembly.instantiate()...');
+
+                let instance;
+                try {
+                    const result = await WebAssembly.instantiate(wasmBytes, imports);
+                    instance = result.instance;
+                } catch (wasmErr: any) {
+                    addLog('COMPILE ERR: ' + (wasmErr?.message || wasmErr));
+                    setStatusMessage('WASM_FAIL');
+                    return;
+                }
+
                 if (isDestroyed) return;
+                addLog('4. Insta-success');
 
                 moduleInstanceMemory = instance.exports.memory;
                 doomInstanceRef.current = instance.exports;
 
-                // Defer the game start routine slightly so the DOM can settle
                 setTimeout(() => {
                     if (isDestroyed) return;
                     try {
-                        console.log('[Doom] Init Game...');
+                        addLog('5. Starting execution');
                         instance.exports.initGame();
-
-                        console.log('[Doom] Starting tick interval...');
                         tickIntervalRef.current = setInterval(instance.exports.tickGame, 1000 / 35);
-                    } catch (err) {
-                        console.error('[Doom] Critical runtime Crash inside WASM:', err);
-                        setStatusMessage('RUNTIME CRASH');
+                        setStatusMessage('');
+                    } catch (err: any) {
+                        addLog('CRASH: ' + (err.message || 'Unknown'));
                     }
-                }, 100);
+                }, 150);
 
-            } catch (err) {
-                console.error('Failed to init DOOM:', err);
-                if (!isDestroyed) setStatusMessage('FAILED TO BOOT');
+            } catch (err: any) {
+                addLog(`FAIL: ${err?.message || err}`);
+                setStatusMessage('DEAD');
             }
         }
 
@@ -239,55 +266,65 @@ onPressOut = {() => keyUp(doomKey)}
   );
 
 return (
-    <GestureHandlerRootView style= { styles.root } >
-    <View style={ styles.container }>
+    <SafeAreaView style= {{ flex: 1, backgroundColor: '#000' }}>
+        <GestureHandlerRootView style={ styles.root }>
+            <View style={ styles.container }>
 
-        {/* ── LEFT: Joystick + Strafe ── */ }
-        < View style = { styles.leftPanel } >
-            <View style={ styles.strafeRow }>
-                <ActionButton label="◄" doomKey = "," />
-                    <ActionButton label="►" doomKey = "." />
-                        </View>
+                {/* ── LEFT: Joystick + Strafe ── */ }
+                < View style = { styles.leftPanel } >
+                    <View style={ styles.strafeRow }>
+                        <ActionButton label="◄" doomKey = "," />
+                            <ActionButton label="►" doomKey = "." />
+                                </View>
 
-                        < GestureDetector gesture = { joystickPan } >
-                            <View style={ styles.joystickBase }>
-                            {
-                                [0, 1, 2, 3, 4].map(row => [0, 1, 2, 3, 4].map(col => (
-                                    <View
-                  key= {`${row}-${col}`}
+                                < GestureDetector gesture = { joystickPan } >
+                                    <View style={ styles.joystickBase }>
+                                    {
+                                        [0, 1, 2, 3, 4].map(row => [0, 1, 2, 3, 4].map(col => (
+                                            <View
+                    key= {`${row}-${col}`}
 style = { [styles.dot, row === 2 && col === 2 && styles.dotCenter]}
     />
-              )))}
+                )))}
 <Animated.View
-                style={
+                  style={
     [
         styles.joystickKnob,
         { transform: [{ translateX: joystickX }, { translateY: joystickY }] },
     ]
 }
-              />
+                />
     </View>
     </GestureDetector>
 
     < Text style = { styles.label } > MOVE </Text>
         </View>
 
-{/* ── CENTER: Game ── */ }
+{/* ── CENTER: Game / Logs ── */ }
 <View style={ styles.gameContainer }>
     <View style={ styles.scanlines } pointerEvents = "none" />
+
     {
         doomFrameUri?(
-            <Image
-              source = {{ uri: doomFrameUri }}
+              <Image
+                source = {{ uri: doomFrameUri }}
 style = { styles.webview }
 resizeMode = "stretch"
 fadeDuration = { 0}
     />
-          ) : (
-    <View style= {{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#000' }}>
-        <Text style={ { color: '#555', fontSize: 10, fontWeight: 'bold' } }> { statusMessage } </Text>
-            </View>
-          )}
+            ) : (
+    <View style= {{ flex: 1, justifyContent: 'center', backgroundColor: '#111' }}>
+        <View style={ { position: 'absolute', top: 10, left: 10, zIndex: 100 } }>
+            <Text style={ { color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 5 } }> [WASM ENGINE STATUS] </Text>
+{
+    devLogs.map((log, i) => (
+        <Text key= { i } style = {{ color: '#0f0', fontSize: 10, fontFamily: 'monospace' }}> { '>'} { log } </Text>
+                  ))}
+{ statusMessage ? <Text style={ { color: 'red', fontSize: 14, marginTop: 10, fontWeight: 'bold' } }> !!{ statusMessage }!! </Text> : null }
+</View>
+    </View>
+            )}
+
 <View style={ styles.cornerTag }>
     <Text style={ styles.cornerTagText }> DOOM </Text>
         </View>
@@ -305,6 +342,7 @@ fadeDuration = { 0}
 
                         </View>
                         </GestureHandlerRootView>
+                        </SafeAreaView>
   );
 }
 
