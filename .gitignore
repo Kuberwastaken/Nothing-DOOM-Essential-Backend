@@ -1,5 +1,6 @@
 # Ignore the contents of the 'build' directory
-/build/
+/build/*
+!/build/doom.wasm
 
 # Ignore the contents of any virtual environment
 /.dev_virtualenvs/
