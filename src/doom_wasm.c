@@ -89,7 +89,8 @@ struct DB_BytesForAllWads DG_GetWads() {
 
     // Assign data for IWAD (which must be the first WAD)
     result.iWad.data = dataForNextWad;
-    result.iWad.byteLength = byteLengthOfEachWad[0];
+    result.iWad.byteLength = byteLengthOfEa
+    chWad[0];
     dataForNextWad += byteLengthOfEachWad[0];
 
     // Assign data each PWADs

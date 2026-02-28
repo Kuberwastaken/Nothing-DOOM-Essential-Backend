@@ -1,589 +1,482 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { View, Text, StyleSheet, Pressable, Animated, Image, SafeAreaView, ScrollView } from 'react-native';
+import { View, Text, StyleSheet, Pressable, Animated, Image, SafeAreaView } from 'react-native';
 import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler';
-import { tokens } from './src/styles/tokens';
 
 const REMOTE_WASM_URL = 'https://kuber.studio/Nothing-DOOM-Essential-Backend/build/doom.wasm';
 
 const b64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 function fastB64Encode(bytes: Uint8Array): string {
-    let res = '';
-    const len = bytes.length;
-    const rem = len % 3;
-    const max = len - rem;
-    for (let i = 0; i < max; i += 3) {
-        res += b64chars[bytes[i] >> 2] +
-            b64chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)] +
-            b64chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)] +
-            b64chars[bytes[i + 2] & 63];
-    }
-    if (rem === 1) {
-        res += b64chars[bytes[max] >> 2] + b64chars[(bytes[max] & 3) << 4] + '==';
-    } else if (rem === 2) {
-        res += b64chars[bytes[max] >> 2] +
-            b64chars[((bytes[max] & 3) << 4) | (bytes[max + 1] >> 4)] +
-            b64chars[(bytes[max + 1] & 15) << 2] + '=';
-    }
-    return res;
+  let res = '';
+  const len = bytes.length;
+  const rem = len % 3;
+  const max = len - rem;
+  for (let i = 0; i < max; i += 3) {
+    res +=
+      b64chars[bytes[i] >> 2] +
+      b64chars[((bytes[i] & 3) << 4) | (bytes[i + 1] >> 4)] +
+      b64chars[((bytes[i + 1] & 15) << 2) | (bytes[i + 2] >> 6)] +
+      b64chars[bytes[i + 2] & 63];
+  }
+  if (rem === 1) {
+    res += b64chars[bytes[max] >> 2] + b64chars[(bytes[max] & 3) << 4] + '==';
+  } else if (rem === 2) {
+    res +=
+      b64chars[bytes[max] >> 2] +
+      b64chars[((bytes[max] & 3) << 4) | (bytes[max + 1] >> 4)] +
+      b64chars[(bytes[max + 1] & 15) << 2] +
+      '=';
+  }
+  return res;
 }
 
-function readModuleMemoryAsUtf8String(moduleMemory: any, offsetIntoMemory: number, stringByteLength: number) {
-    const buffer8 = new Uint8Array(moduleMemory.buffer);
-    const data = buffer8.slice(offsetIntoMemory, offsetIntoMemory + stringByteLength);
-    let str = '';
-    for (let i = 0; i < data.length; i++) {
-        str += String.fromCharCode(data[i]);
-    }
-    return str;
+function resolveExport(exp: any): number {
+  if (exp == null) return 0;
+  if (typeof exp === 'number') return exp;
+  if (typeof exp === 'object' && 'value' in exp) return Number(exp.value);
+  return 0;
 }
 
-const JOYSTICK_SIZE = 72;
-const JOYSTICK_KNOB_SIZE = 28;
-const JOYSTICK_RANGE = 20;
+const JOYSTICK_SIZE = 80;
+const JOYSTICK_KNOB = 32;
+const JOYSTICK_RANGE = 22;
+
+const K = {
+  ENTER: 13,
+  ESCAPE: 27,
+  LEFT: 0xac,
+  RIGHT: 0xae,
+  UP: 0xad,
+  DOWN: 0xaf,
+  STRAFEL: 0xa0,
+  STRAFER: 0xa1,
+  FIRE: 0xa2,
+  USE: 0x20,
+};
 
 export default function App() {
-    const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set());
-    const [doomFrameUri, setDoomFrameUri] = useState<string | null>(null);
-    const [statusMessage, setStatusMessage] = useState<string>('STARTING...');
-    const [devLogs, setDevLogs] = useState<string[]>([]);
+  const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set());
+  const [doomFrameUri, setDoomFrameUri] = useState<string | null>(null);
+  const [dbg, setDbg] = useState('INIT');
 
-    const logScrollRef = useRef<ScrollView>(null);
+  const frameCountRef = useRef<number>(0);
+  const autoStarted = useRef<boolean>(false);
+  const joystickX = useRef(new Animated.Value(0)).current;
+  const joystickY = useRef(new Animated.Value(0)).current;
+  const activeDirections = useRef<Set<string>>(new Set());
+  const doomRef = useRef<any>(null);
+  const tickRef = useRef<any>(null);
 
-    const addLog = (msg: string) => {
-        setDevLogs(prev => {
-            const next = [...prev, msg];
-            if (next.length > 100) return next.slice(-100);
-            return next;
-        });
+  useEffect(() => {
+    let dead = false;
+
+    let WASM_W = 0,
+      WASM_H = 0,
+      OUT_W = 0,
+      OUT_H = 0;
+
+    // BMP packing
+    let ROW_SIZE = 0; // padded row size in bytes
+    let PAD = 0; // padding bytes per row
+
+    let bmpBuf: Uint8Array | null = null;
+    let wMem: any = null;
+
+    const fireKey = (code: number, delay = 0) => {
+      setTimeout(() => {
+        if (dead || !doomRef.current) return;
+        try {
+          doomRef.current.reportKeyDown(code);
+        } catch (_) {}
+        setTimeout(() => {
+          try {
+            if (!dead) doomRef.current?.reportKeyUp(code);
+          } catch (_) {}
+        }, 120);
+      }, delay);
     };
 
-    useEffect(() => {
-        if (logScrollRef.current) {
-            logScrollRef.current.scrollToEnd({ animated: true });
-        }
-    }, [devLogs]);
+    const imports = {
+      loading: {
+        onGameInit: (w: number, h: number) => {
+          WASM_W = w;
+          WASM_H = h;
 
-    const frameCountRef = useRef<number>(0);
-    const joystickX = useRef(new Animated.Value(0)).current;
-    const joystickY = useRef(new Animated.Value(0)).current;
-    const activeDirections = useRef<Set<string>>(new Set());
+          OUT_W = Math.floor(w / 2);
+          OUT_H = Math.floor(h / 2);
 
-    const doomInstanceRef = useRef<any>(null);
-    const tickIntervalRef = useRef<any>(null);
+          // 24bpp BMP rows must be padded to multiples of 4 bytes
+          ROW_SIZE = (OUT_W * 3 + 3) & ~3;
+          PAD = ROW_SIZE - OUT_W * 3;
+          const imageSize = ROW_SIZE * OUT_H;
 
-    useEffect(() => {
-        let isDestroyed = false;
+          bmpBuf = new Uint8Array(54 + imageSize);
+          const v = new DataView(bmpBuf.buffer);
 
-        let CURRENT_WIDTH = 0;
-        let CURRENT_HEIGHT = 0;
-        let WASM_WIDTH = 0;
-        let WASM_HEIGHT = 0;
-        let PIXEL_DATA_SIZE = 0;
-        let bmpBuffer: Uint8Array | null = null;
-        let moduleInstanceMemory: any = null;
+          // --- BMP FILE HEADER (14 bytes) ---
+          // Fix: write literal 'B','M' so endianness can’t bite you.
+          v.setUint8(0, 0x42); // 'B'
+          v.setUint8(1, 0x4d); // 'M'
+          v.setUint32(2, bmpBuf.length, true); // file size
+          v.setUint16(6, 0, true); // reserved1
+          v.setUint16(8, 0, true); // reserved2
+          v.setUint32(10, 54, true); // pixel data offset
 
-        const imports = {
-            loading: {
-                onGameInit: (width: number, height: number) => {
-                    addLog(`Game Init: ${width}x${height}`);
+          // --- DIB HEADER: BITMAPINFOHEADER (40 bytes) ---
+          v.setUint32(14, 40, true); // header size
+          v.setInt32(18, OUT_W, true);
+          v.setInt32(22, -OUT_H, true); // negative => top-down
+          v.setUint16(26, 1, true); // planes
+          v.setUint16(28, 24, true); // bpp
+          v.setUint32(30, 0, true); // compression = BI_RGB
+          v.setUint32(34, imageSize, true); // biSizeImage (helps some decoders)
+          v.setInt32(38, 0, true); // x pixels per meter
+          v.setInt32(42, 0, true); // y pixels per meter
+          v.setUint32(46, 0, true); // colors used
+          v.setUint32(50, 0, true); // important colors
 
-                    WASM_WIDTH = width;
-                    WASM_HEIGHT = height;
-                    CURRENT_WIDTH = Math.floor(width / 2);
-                    CURRENT_HEIGHT = Math.floor(height / 2);
+          setDbg(`INIT ${w}x${h} -> ${OUT_W}x${OUT_H}`);
+        },
+        wadSizes: () => {},
+        readWads: () => {},
+      },
 
-                    // Downscale to 24-bit to completely avoid invisible Alpha channels natively
-                    PIXEL_DATA_SIZE = CURRENT_WIDTH * CURRENT_HEIGHT * 3;
+      ui: {
+        drawFrame: (idx: number) => {
+          if (dead || !wMem || !bmpBuf) {
+            setDbg(`DF SKIP wMem=${!!wMem} buf=${!!bmpBuf}`);
+            return;
+          }
 
-                    bmpBuffer = new Uint8Array(54 + PIXEL_DATA_SIZE);
-                    const bmpView = new DataView(bmpBuffer.buffer);
+          try {
+            frameCountRef.current++;
+            const fc = frameCountRef.current;
 
-                    bmpView.setUint16(0, 0x4D42, false);
-                    bmpView.setUint32(2, bmpBuffer.length, true);
-                    bmpView.setUint32(10, 54, true);
-                    bmpView.setUint32(14, 40, true);
-                    bmpView.setUint32(18, CURRENT_WIDTH, true);
-                    bmpView.setInt32(22, -CURRENT_HEIGHT, true); // Stick with Top-Down for JS array bounds correlation
-                    bmpView.setUint16(26, 1, true);
-                    bmpView.setUint16(28, 24, true); // Force 24-bit BGR format
-                    bmpView.setUint32(30, 0, true);
-                },
-                wadSizes: () => { },
-                readWads: () => { },
-            },
-            ui: {
-                drawFrame: (indexOfFrameBuffer: number) => {
-                    if (isDestroyed || !moduleInstanceMemory || !bmpBuffer) return;
-                    try {
-                        if (frameCountRef.current === 0) addLog('DRAWN FIRST FRAME!');
-                        if (frameCountRef.current % 35 === 0) addLog(`DRAWN ${frameCountRef.current} FRAMES!`);
+            if (fc % 5 === 0) setDbg(`F:${fc}`);
 
-                        // Run at 17 FPS now that payload is 80% smaller
-                        if (frameCountRef.current % 2 !== 0) {
-                            frameCountRef.current++;
-                            return;
-                        }
-
-                        frameCountRef.current++;
-
-                        const srcBytesRequired = WASM_WIDTH * WASM_HEIGHT * 4;
-                        if (moduleInstanceMemory.buffer.byteLength < indexOfFrameBuffer + srcBytesRequired) {
-                            if (frameCountRef.current < 5) addLog('CRASH: Memory Underflow!');
-                            return;
-                        }
-
-                        const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, srcBytesRequired);
-
-                        // Copy out pixels at 50% scale, converting RGBA to BGR
-                        let destOffset = 54;
-                        for (let y = 0; y < CURRENT_HEIGHT; y++) {
-                            const srcY = y * 2;
-                            let srcRowOffset = srcY * WASM_WIDTH * 4;
-                            for (let x = 0; x < CURRENT_WIDTH; x++) {
-                                let srcOffset = srcRowOffset + (x * 2 * 4);
-                                bmpBuffer[destOffset++] = doomPixels[srcOffset + 2]; // B
-                                bmpBuffer[destOffset++] = doomPixels[srcOffset + 1]; // G
-                                bmpBuffer[destOffset++] = doomPixels[srcOffset + 0]; // R
-                            }
-                        }
-
-                        const base64Str = fastB64Encode(bmpBuffer);
-                        setDoomFrameUri(`data:image/bmp;base64,${base64Str}`);
-                    } catch (e: any) {
-                        console.error(e);
-                    }
-                },
-            },
-            runtimeControl: {
-                timeInMilliseconds: () => BigInt(Math.trunc(Date.now())),
-            },
-            console: {
-                onInfoMessage: (messagePtr: number, length: number) => {
-                },
-                onErrorMessage: (messagePtr: number, length: number) => {
-                    addLog('[WASM ERR] ' + readModuleMemoryAsUtf8String(moduleInstanceMemory, messagePtr, length));
-                },
-            },
-            gameSaving: {
-                sizeOfSaveGame: () => 0,
-                readSaveGame: () => 0,
-                writeSaveGame: () => 0,
-            },
-        };
-
-        async function initDoom() {
-            try {
-                addLog('1. Fetching URL...');
-                setStatusMessage('DOWNLOADING ENGINE...');
-
-                if (typeof WebAssembly === 'undefined') {
-                    throw new Error('WebAssembly global object is UNDEFINED. Current Javascript engine (Hermes?) does not support compilation.');
-                }
-
-                const response = await fetch(REMOTE_WASM_URL);
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-                addLog('2. Getting array buffer...');
-                const wasmBytes = await response.arrayBuffer();
-                addLog(`Buffer bytes: ${wasmBytes.byteLength}`);
-
-                setStatusMessage('COMPILING WASM...');
-                addLog('3. WebAssembly.instantiate()...');
-
-                let instance;
-                try {
-                    const result = await WebAssembly.instantiate(wasmBytes, imports);
-                    instance = result.instance;
-                } catch (wasmErr: any) {
-                    addLog('COMPILE ERR: ' + (wasmErr?.message || wasmErr));
-                    setStatusMessage('WASM_FAIL');
-                    return;
-                }
-
-                if (isDestroyed) return;
-                addLog('4. Insta-success');
-
-                moduleInstanceMemory = instance.exports.memory;
-                doomInstanceRef.current = instance.exports;
-
-                setTimeout(() => {
-                    if (isDestroyed) return;
-                    try {
-                        addLog('5. Starting execution');
-                        instance.exports.initGame();
-                        tickIntervalRef.current = setInterval(instance.exports.tickGame, 1000 / 35);
-                        setStatusMessage('');
-                    } catch (err: any) {
-                        addLog('CRASH: ' + (err.message || 'Unknown'));
-                    }
-                }, 150);
-
-            } catch (err: any) {
-                addLog(`FAIL: ${err?.message || err}`);
-                setStatusMessage('DEAD');
+            if (!autoStarted.current && fc >= 35) {
+              autoStarted.current = true;
+              setDbg('AUTO-START');
+              fireKey(K.ENTER, 0);
+              fireKey(K.ENTER, 600);
+              fireKey(K.ENTER, 1200);
             }
-        }
 
-        initDoom();
+            // render every other frame
+            if (fc % 2 !== 0) return;
 
-        return () => {
-            isDestroyed = true;
-            if (tickIntervalRef.current) clearInterval(tickIntervalRef.current);
-        };
-    }, []);
+            const needed = WASM_W * WASM_H * 4;
+            if (wMem.buffer.byteLength < idx + needed) {
+              setDbg('MEM UNDERFLOW');
+              return;
+            }
 
-    const resolveDoomKey = (key: string) => {
-        if (!doomInstanceRef.current) return null;
-        const exports = doomInstanceRef.current;
-        const map: Record<string, number> = {
-            ArrowLeft: exports.KEY_LEFTARROW,
-            ArrowRight: exports.KEY_RIGHTARROW,
-            ArrowUp: exports.KEY_UPARROW,
-            ArrowDown: exports.KEY_DOWNARROW,
-            ',': exports.KEY_STRAFE_L,
-            '.': exports.KEY_STRAFE_R,
-            'Control': exports.KEY_FIRE,
-            ' ': exports.KEY_USE,
-            'Shift': exports.KEY_SHIFT,
-            'Tab': exports.KEY_TAB,
-            'Escape': exports.KEY_ESCAPE,
-            'Enter': exports.KEY_ENTER,
-            'Backspace': exports.KEY_BACKSPACE,
-            'Alt': exports.KEY_ALT,
-        };
-        if (map[key] !== undefined) return map[key];
-        if (key.length === 1) return key.charCodeAt(0);
-        return null;
+            const src = new Uint8Array(wMem.buffer, idx, needed);
+
+            // write BMP pixel data (BGR) with row padding
+            let dst = 54;
+            for (let y = 0; y < OUT_H; y++) {
+              const srcRow = y * 2 * WASM_W * 4;
+
+              for (let x = 0; x < OUT_W; x++) {
+                const s = srcRow + x * 2 * 4;
+                bmpBuf[dst++] = src[s + 2]; // B
+                bmpBuf[dst++] = src[s + 1]; // G
+                bmpBuf[dst++] = src[s + 0]; // R
+              }
+
+              // pad row to 4-byte boundary
+              for (let i = 0; i < PAD; i++) bmpBuf[dst++] = 0;
+            }
+
+            setDoomFrameUri(`data:image/bmp;base64,${fastB64Encode(bmpBuf)}`);
+          } catch (e: any) {
+            setDbg('DF ERR:' + (e?.message ?? '?'));
+          }
+        },
+      },
+
+      runtimeControl: {
+        timeInMilliseconds: () => BigInt(Math.trunc(Date.now())),
+      },
+
+      console: {
+        onInfoMessage: () => {},
+        onErrorMessage: (ptr: number, len: number) => {
+          if (!wMem) return;
+          const buf = new Uint8Array(wMem.buffer);
+          let s = '';
+          for (let i = 0; i < len; i++) s += String.fromCharCode(buf[ptr + i]);
+          setDbg('WERR:' + s.slice(0, 30));
+        },
+      },
+
+      gameSaving: { sizeOfSaveGame: () => 0, readSaveGame: () => 0, writeSaveGame: () => 0 },
     };
 
-    const keyDown = (key: string) => {
-        if (activeKeys.has(key)) return;
-        setActiveKeys(prev => new Set(prev).add(key));
-        const doomKey = resolveDoomKey(key);
-        if (doomKey !== null) doomInstanceRef.current?.reportKeyDown(doomKey);
+    (async () => {
+      try {
+        setDbg('FETCH');
+        const res = await fetch(REMOTE_WASM_URL);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const bytes = await res.arrayBuffer();
+        setDbg(`FETCHED ${(bytes.byteLength / 1024).toFixed(0)}kb`);
+
+        setDbg('COMPILING');
+        const { instance } = await WebAssembly.instantiate(bytes, imports);
+        if (dead) return;
+
+        setDbg('COMPILED OK');
+        wMem = instance.exports.memory;
+        doomRef.current = instance.exports;
+
+        setTimeout(() => {
+          if (dead) return;
+          setDbg('INIT GAME');
+          try {
+            instance.exports.initGame();
+          } catch (e: any) {
+            setDbg('INIT ERR:' + e?.message);
+            return;
+          }
+          setDbg('TICKING');
+          tickRef.current = setInterval(instance.exports.tickGame, 1000 / 35);
+        }, 150);
+      } catch (e: any) {
+        setDbg('ERR:' + (e?.message ?? '?'));
+      }
+    })();
+
+    return () => {
+      dead = true;
+      if (tickRef.current) clearInterval(tickRef.current);
     };
+  }, []);
 
-    const keyUp = (key: string) => {
-        setActiveKeys(prev => {
-            const next = new Set(prev);
-            next.delete(key);
-            return next;
-        });
-        const doomKey = resolveDoomKey(key);
-        if (doomKey !== null) doomInstanceRef.current?.reportKeyUp(doomKey);
+  const getKey = (key: string): number => {
+    const exp = doomRef.current;
+    const r = (n: string, fb: number) => resolveExport(exp?.[n]) || fb;
+    const map: Record<string, number> = {
+      ArrowLeft: r('KEY_LEFTARROW', K.LEFT),
+      ArrowRight: r('KEY_RIGHTARROW', K.RIGHT),
+      ArrowUp: r('KEY_UPARROW', K.UP),
+      ArrowDown: r('KEY_DOWNARROW', K.DOWN),
+      ',': r('KEY_STRAFE_L', K.STRAFEL),
+      '.': r('KEY_STRAFE_R', K.STRAFER),
+      Control: r('KEY_FIRE', K.FIRE),
+      ' ': r('KEY_USE', K.USE),
+      Escape: r('KEY_ESCAPE', K.ESCAPE),
+      Enter: r('KEY_ENTER', K.ENTER),
     };
+    return map[key] ?? (key.length === 1 ? key.charCodeAt(0) : 0);
+  };
 
-    const joystickPan = Gesture.Pan()
-        .runOnJS(true)
-        .onUpdate((e) => {
-            const clampedX = Math.max(-JOYSTICK_RANGE, Math.min(JOYSTICK_RANGE, e.translationX));
-            const clampedY = Math.max(-JOYSTICK_RANGE, Math.min(JOYSTICK_RANGE, e.translationY));
-            joystickX.setValue(clampedX);
-            joystickY.setValue(clampedY);
+  const press = (key: string) => {
+    if (activeKeys.has(key)) return;
+    setActiveKeys((prev) => new Set(prev).add(key));
+    const k = getKey(key);
+    if (k) doomRef.current?.reportKeyDown(k);
+  };
 
-            const threshold = 7;
-            const newDirs = new Set<string>();
+  const release = (key: string) => {
+    setActiveKeys((prev) => {
+      const n = new Set(prev);
+      n.delete(key);
+      return n;
+    });
+    const k = getKey(key);
+    if (k) doomRef.current?.reportKeyUp(k);
+  };
 
-            if (clampedY < -threshold) newDirs.add('ArrowUp');
-            if (clampedY > threshold) newDirs.add('ArrowDown');
-            if (clampedX < -threshold) newDirs.add('ArrowLeft');
-            if (clampedX > threshold) newDirs.add('ArrowRight');
+  const joystickGesture = Gesture.Pan()
+    .runOnJS(true)
+    .onUpdate((e) => {
+      const cx = Math.max(-JOYSTICK_RANGE, Math.min(JOYSTICK_RANGE, e.translationX));
+      const cy = Math.max(-JOYSTICK_RANGE, Math.min(JOYSTICK_RANGE, e.translationY));
+      joystickX.setValue(cx);
+      joystickY.setValue(cy);
+      const t = 8,
+        want = new Set<string>();
+      if (cy < -t) want.add('ArrowUp');
+      if (cy > t) want.add('ArrowDown');
+      if (cx < -t) want.add('ArrowLeft');
+      if (cx > t) want.add('ArrowRight');
+      activeDirections.current.forEach((d) => {
+        if (!want.has(d)) release(d);
+      });
+      want.forEach((d) => {
+        if (!activeDirections.current.has(d)) press(d);
+      });
+      activeDirections.current = want;
+    })
+    .onEnd(() => {
+      Animated.spring(joystickX, { toValue: 0, useNativeDriver: false, tension: 140, friction: 12 }).start();
+      Animated.spring(joystickY, { toValue: 0, useNativeDriver: false, tension: 140, friction: 12 }).start();
+      activeDirections.current.forEach((d) => release(d));
+      activeDirections.current.clear();
+    });
 
-            activeDirections.current.forEach(dir => {
-                if (!newDirs.has(dir)) keyUp(dir);
-            });
-            newDirs.forEach(dir => {
-                if (!activeDirections.current.has(dir)) keyDown(dir);
-            });
-
-            activeDirections.current = newDirs;
-        })
-        .onEnd(() => {
-            Animated.spring(joystickX, { toValue: 0, useNativeDriver: false, tension: 120, friction: 10 }).start();
-            Animated.spring(joystickY, { toValue: 0, useNativeDriver: false, tension: 120, friction: 10 }).start();
-            activeDirections.current.forEach(dir => keyUp(dir));
-            activeDirections.current.clear();
-        });
-
-    const ActionButton = ({ label, doomKey, flex, red }: { label: string; doomKey: string; flex?: number; red?: boolean; }) => (
-        <Pressable
-            style= {({ pressed }) => [
-        styles.actionBtn,
-        flex ? { flex } : {},
-        (pressed || activeKeys.has(doomKey)) && (red ? styles.actionBtnActiveRed : styles.actionBtnActive),
-    ]
-}
-onPressIn = {() => keyDown(doomKey)}
-onPressOut = {() => keyUp(doomKey)}
-        >
-    <Text style={ styles.actionBtnText }> { label } </Text>
-        </Pressable>
-    );
-
-return (
-    <SafeAreaView style= {{ flex: 1, backgroundColor: '#000' }}>
-        <GestureHandlerRootView style={ styles.root }>
-            <View style={ styles.container }>
-
-                <View style={ styles.leftPanel }>
-                    <View style={ styles.strafeRow }>
-                        <ActionButton label="◄" doomKey = "," />
-                            <ActionButton label="►" doomKey = "." />
-                                </View>
-
-                                < GestureDetector gesture = { joystickPan } >
-                                    <View style={ styles.joystickBase }>
-                                    {
-                                        [0, 1, 2, 3, 4].map(row => [0, 1, 2, 3, 4].map(col => (
-                                            <View
-                                        key= {`${row}-${col}`}
-style = { [styles.dot, row === 2 && col === 2 && styles.dotCenter]}
-    />
-                                )))}
-<Animated.View
-                                    style={
-    [
-        styles.joystickKnob,
-        { transform: [{ translateX: joystickX }, { translateY: joystickY }] },
-    ]
-}
-                                />
-    </View>
-    </GestureDetector>
-
-    < Text style = { styles.label } > MOVE </Text>
-        </View>
-
-        < View style = { styles.gameContainer } >
-            <View style={ styles.scanlines } pointerEvents = "none" />
-
-            {
-                doomFrameUri?(
-                            <Image
-                                source = {{ uri: doomFrameUri }}
-style = { [styles.webview, { transform: [{ scaleY: -1 }] }]}
-resizeMode = "stretch"
-fadeDuration = { 0}
-    />
-                        ) : (
-    <View style= {{ flex: 1, backgroundColor: '#111' }} />
-                        )}
-
-<View style={ styles.logContainer } pointerEvents = "box-none" >
-    <Text style={ styles.logHeader }> [WASM ENGINE STATUS] </Text>
-        < ScrollView
-ref = { logScrollRef }
-style = { styles.logScrollView }
-contentContainerStyle = { styles.logContent }
-showsVerticalScrollIndicator = { true}
-persistentScrollbar = { true}
+  const Btn = ({
+    label,
+    sub,
+    doomKey,
+    s,
+    ls,
+  }: {
+    label: string;
+    sub?: string;
+    doomKey: string;
+    s?: any;
+    ls?: any;
+  }) => (
+    <Pressable
+      style={[styles.btn, s, activeKeys.has(doomKey) && styles.btnDown]}
+      onPressIn={() => press(doomKey)}
+      onPressOut={() => release(doomKey)}
     >
-{
-    devLogs.map((log, i) => (
-        <Text key= { i } style = { styles.logText } > { '>'} { log } </Text>
-    ))
-}
-    </ScrollView>
-{
-    statusMessage ? (
-        <Text style= { styles.statusText } > !!{ statusMessage }!! </Text>
-                            ) : null
-}
-</View>
+      <Text style={[styles.btnTxt, ls]}>{label}</Text>
+      {sub ? <Text style={styles.btnSub}>{sub}</Text> : null}
+    </Pressable>
+  );
 
-    < View style = { styles.cornerTag } >
-        <Text style={ styles.cornerTagText }> DOOM </Text>
+  return (
+    <SafeAreaView style={styles.safe}>
+      <GestureHandlerRootView style={styles.root}>
+        <View style={styles.layout}>
+          {/* LEFT */}
+          <View style={styles.leftCol}>
+            <View style={styles.strafeRow}>
+              <Btn label="◄" sub="STR" doomKey="," s={styles.strafeBtn} />
+              <Btn label="►" sub="STR" doomKey="." s={styles.strafeBtn} />
             </View>
+            <GestureDetector gesture={joystickGesture}>
+              <View style={styles.stick}>
+                <View style={styles.stickH} pointerEvents="none" />
+                <View style={styles.stickV} pointerEvents="none" />
+                <Animated.View
+                  style={[styles.stickKnob, { transform: [{ translateX: joystickX }, { translateY: joystickY }] }]}
+                />
+              </View>
+            </GestureDetector>
+            <Text style={styles.moveLabel}>MOVE</Text>
+          </View>
+
+          {/* SCREEN */}
+          <View style={styles.screen}>
+            {doomFrameUri ? (
+              <Image
+                // No vertical flip needed because BMP height is negative (top-down)
+                source={{ uri: doomFrameUri }}
+                style={styles.gameImg}
+                resizeMode="stretch"
+                fadeDuration={0}
+              />
+            ) : (
+              <View style={styles.gameImg} />
+            )}
+
+            {/* Debug overlay */}
+            <View style={styles.dbgWrap} pointerEvents="none">
+              <Text style={styles.dbgTxt}>{dbg}</Text>
             </View>
 
-            < View style = { styles.rightPanel } >
-                <ActionButton label="FIRE" doomKey = "Control" flex = { 1} red />
-                    <ActionButton label="USE" doomKey = " " flex = { 1} />
-                        <View style={ styles.smallBtnsRow }>
-                            <ActionButton label="ESC" doomKey = "Escape" />
-                                <ActionButton label="↵" doomKey = "Enter" />
-                                    </View>
-                                    </View>
+            <View style={styles.badge} pointerEvents="none">
+              <Text style={styles.badgeTxt}>DOOM</Text>
+            </View>
+          </View>
 
-                                    </View>
-                                    </GestureHandlerRootView>
-                                    </SafeAreaView>
-    );
+          {/* RIGHT */}
+          <View style={styles.rightCol}>
+            <Btn label="FIRE" doomKey="Control" s={styles.fireBtn} ls={styles.fireTxt} />
+            <Btn label="USE" doomKey=" " s={styles.useBtn} />
+            <View style={styles.utilRow}>
+              <Btn label="ESC" doomKey="Escape" s={styles.utilBtn} />
+              <Btn label="↵" doomKey="Enter" s={styles.utilBtn} />
+            </View>
+          </View>
+        </View>
+      </GestureHandlerRootView>
+    </SafeAreaView>
+  );
 }
+
+const ACCENT = '#FF2020';
+const BG = '#0d0d0d';
+const MID = '#1c1c1c';
+const RAISED = '#2a2a2a';
+const DIM = '#484848';
+const WHITE = '#efefef';
 
 const styles = StyleSheet.create({
-    root: {
-        flex: 1,
-    },
-    container: {
-        flex: 1,
-        flexDirection: 'row',
-        backgroundColor: tokens.colors.dark || '#1a1a1a',
-        borderRadius: 22,
-        overflow: 'hidden',
-        padding: 10,
-        gap: 8,
-    },
+  safe: { flex: 1, backgroundColor: BG },
+  root: { flex: 1 },
+  layout: { flex: 1, flexDirection: 'row', padding: 8, gap: 7, alignItems: 'stretch' },
 
-    leftPanel: {
-        width: 76,
-        alignItems: 'center',
-        justifyContent: 'flex-end',
-        gap: 6,
-        paddingBottom: 2,
-    },
-    strafeRow: {
-        flexDirection: 'row',
-        gap: 4,
-    },
-    joystickBase: {
-        width: JOYSTICK_SIZE,
-        height: JOYSTICK_SIZE,
-        borderRadius: JOYSTICK_SIZE / 2,
-        backgroundColor: tokens.colors['secondary-dark'] || '#333',
-        justifyContent: 'center',
-        alignItems: 'center',
-        flexDirection: 'row',
-        flexWrap: 'wrap',
-        padding: 10,
-        gap: 3,
-    },
-    dot: {
-        width: 3,
-        height: 3,
-        borderRadius: 1.5,
-        backgroundColor: tokens.colors['secondary-light'] || '#aaa',
-        opacity: 0.35,
-    },
-    dotCenter: {
-        backgroundColor: tokens.colors.light || '#fff',
-        opacity: 0.7,
-    },
-    joystickKnob: {
-        position: 'absolute',
-        width: JOYSTICK_KNOB_SIZE,
-        height: JOYSTICK_KNOB_SIZE,
-        borderRadius: JOYSTICK_KNOB_SIZE / 2,
-        backgroundColor: tokens.colors.light || '#fff',
-        shadowColor: '#fff',
-        shadowOpacity: 0.2,
-        shadowRadius: 4,
-    },
-    label: {
-        fontSize: 8,
-        fontWeight: '700',
-        color: tokens.colors['secondary-light'] || '#aaa',
-        letterSpacing: 1.5,
-        opacity: 0.5,
-    },
+  leftCol: { width: 84, alignItems: 'center', justifyContent: 'flex-end', gap: 6, paddingBottom: 2 },
+  strafeRow: { flexDirection: 'row', gap: 5 },
+  strafeBtn: { width: 37, height: 30, borderRadius: 7 },
 
-    gameContainer: {
-        flex: 1,
-        borderRadius: 10,
-        overflow: 'hidden',
-        backgroundColor: '#000',
-    },
-    webview: {
-        flex: 1,
-        backgroundColor: '#000',
-    },
-    scanlines: {
-        position: 'absolute',
-        inset: 0,
-        zIndex: 10,
-        opacity: 0.04,
-        backgroundColor: 'transparent',
-        backgroundImage: 'repeating-linear-gradient(0deg, #000 0px, #000 1px, transparent 1px, transparent 2px)',
-    },
-    logContainer: {
-        position: 'absolute',
-        top: 10,
-        left: 10,
-        zIndex: 100,
-        maxWidth: 160,
-        maxHeight: 120,
-    },
-    logHeader: {
-        color: '#fff',
-        fontSize: 13,
-        fontWeight: 'bold',
-        marginBottom: 5,
-    },
-    logScrollView: {
-        maxHeight: 90,
-        backgroundColor: 'rgba(0, 0, 0, 0.5)',
-        borderRadius: 4,
-        paddingHorizontal: 4,
-    },
-    logContent: {
-        paddingVertical: 4,
-    },
-    logText: {
-        color: '#0f0',
-        fontSize: 10,
-        fontFamily: 'monospace',
-        textShadowColor: '#000',
-        textShadowOffset: { width: 1, height: 1 },
-        textShadowRadius: 1,
-        lineHeight: 12,
-    },
-    statusText: {
-        color: 'red',
-        fontSize: 14,
-        marginTop: 6,
-        fontWeight: 'bold',
-        textShadowColor: '#000',
-        textShadowOffset: { width: 1, height: 1 },
-        textShadowRadius: 1,
-    },
-    cornerTag: {
-        position: 'absolute',
-        top: 6,
-        right: 6,
-        zIndex: 20,
-        backgroundColor: 'rgba(0,0,0,0.6)',
-        paddingHorizontal: 5,
-        paddingVertical: 2,
-        borderRadius: 3,
-        borderWidth: 1,
-        borderColor: '#D81921',
-    },
-    cornerTagText: {
-        color: '#D81921',
-        fontSize: 7,
-        fontWeight: '900',
-        letterSpacing: 2,
-    },
+  stick: {
+    width: JOYSTICK_SIZE,
+    height: JOYSTICK_SIZE,
+    borderRadius: JOYSTICK_SIZE / 2,
+    backgroundColor: MID,
+    borderWidth: 1.5,
+    borderColor: RAISED,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  stickH: { position: 'absolute', width: '55%', height: 1, backgroundColor: RAISED },
+  stickV: { position: 'absolute', width: 1, height: '55%', backgroundColor: RAISED },
+  stickKnob: {
+    width: JOYSTICK_KNOB,
+    height: JOYSTICK_KNOB,
+    borderRadius: JOYSTICK_KNOB / 2,
+    backgroundColor: WHITE,
+    shadowColor: '#fff',
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 4,
+  },
+  moveLabel: { fontSize: 7, fontWeight: '700', color: DIM, letterSpacing: 2 },
 
-    rightPanel: {
-        width: 62,
-        gap: 5,
-        justifyContent: 'flex-end',
-        paddingBottom: 2,
-    },
-    actionBtn: {
-        backgroundColor: tokens.colors['secondary-dark'] || '#333',
-        borderRadius: 8,
-        justifyContent: 'center',
-        alignItems: 'center',
-        paddingVertical: 6,
-        paddingHorizontal: 4,
-        minHeight: 28,
-    },
-    actionBtnActive: {
-        backgroundColor: tokens.colors.light || '#fff',
-    },
-    actionBtnActiveRed: {
-        backgroundColor: '#D81921',
-    },
-    actionBtnText: {
-        color: tokens.colors.light || '#fff',
-        fontSize: 9,
-        fontWeight: '800',
-        letterSpacing: 0.8,
-    },
-    smallBtnsRow: {
-        flexDirection: 'row',
-        gap: 4,
-    },
+  screen: { flex: 1, borderRadius: 8, overflow: 'hidden', backgroundColor: '#000' },
+  gameImg: { flex: 1, backgroundColor: '#000' },
+
+  dbgWrap: { position: 'absolute', top: 4, left: 6 },
+  dbgTxt: { color: '#00ff00', fontSize: 7, fontWeight: '700', fontFamily: 'monospace' },
+
+  badge: {
+    position: 'absolute',
+    top: 4,
+    right: 5,
+    backgroundColor: 'rgba(0,0,0,0.75)',
+    paddingHorizontal: 4,
+    paddingVertical: 1,
+    borderRadius: 3,
+    borderWidth: 1,
+    borderColor: ACCENT,
+  },
+  badgeTxt: { color: ACCENT, fontSize: 6, fontWeight: '900', letterSpacing: 2 },
+
+  rightCol: { width: 60, gap: 5, justifyContent: 'flex-end', paddingBottom: 2 },
+  btn: {
+    borderRadius: 9,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 5,
+    backgroundColor: RAISED,
+    borderWidth: 1,
+    borderColor: '#333',
+    minHeight: 28,
+  },
+  btnDown: { backgroundColor: '#444', borderColor: '#555' },
+  btnTxt: { color: WHITE, fontSize: 8, fontWeight: '800', letterSpacing: 1 },
+  btnSub: { color: DIM, fontSize: 6, fontWeight: '600', letterSpacing: 1, marginTop: 1 },
+
+  fireBtn: { flex: 1, backgroundColor: '#1a0000', borderColor: ACCENT, borderWidth: 1.5 },
+  fireTxt: { color: ACCENT, fontSize: 10, fontWeight: '900', letterSpacing: 2 },
+  useBtn: { flex: 1 },
+  utilRow: { flexDirection: 'row', gap: 4 },
+  utilBtn: { flex: 1, backgroundColor: MID, borderColor: '#252525' },
 });
