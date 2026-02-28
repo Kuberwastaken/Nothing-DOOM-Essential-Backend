@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { View, Text, StyleSheet, Pressable, Animated, Image, ScrollView, SafeAreaView } from 'react-native';
+import { View, Text, StyleSheet, Pressable, Animated, Image, SafeAreaView } from 'react-native';
 import { GestureHandlerRootView, Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { tokens } from './src/styles/tokens';
 
@@ -49,6 +49,7 @@ export default function App() {
 
     const addLog = (msg: string) => setDevLogs(prev => [...prev.slice(-9), msg]);
 
+    const frameCountRef = useRef<number>(0);
     const joystickX = useRef(new Animated.Value(0)).current;
     const joystickY = useRef(new Animated.Value(0)).current;
     const activeDirections = useRef<Set<string>>(new Set());
@@ -89,6 +90,10 @@ export default function App() {
                 drawFrame: (indexOfFrameBuffer: number) => {
                     if (isDestroyed || !moduleInstanceMemory) return;
                     try {
+                        if (frameCountRef.current === 0) addLog('DRAWN FIRST FRAME!');
+                        if (frameCountRef.current === 35) addLog('DRAWN 35 FRAMES!');
+                        frameCountRef.current++;
+
                         const doomPixels = new Uint8Array(moduleInstanceMemory.buffer, indexOfFrameBuffer, PIXEL_DATA_SIZE);
                         bmpBuffer.set(doomPixels, 54);
                         const base64Str = fastB64Encode(bmpBuffer);
@@ -313,22 +318,23 @@ resizeMode = "stretch"
 fadeDuration = { 0}
     />
             ) : (
-    <View style= {{ flex: 1, justifyContent: 'center', backgroundColor: '#111' }}>
-        <View style={ { position: 'absolute', top: 10, left: 10, zIndex: 100 } }>
-            <Text style={ { color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 5 } }> [WASM ENGINE STATUS] </Text>
-{
-    devLogs.map((log, i) => (
-        <Text key= { i } style = {{ color: '#0f0', fontSize: 10, fontFamily: 'monospace' }}> { '>'} { log } </Text>
-                  ))}
-{ statusMessage ? <Text style={ { color: 'red', fontSize: 14, marginTop: 10, fontWeight: 'bold' } }> !!{ statusMessage }!! </Text> : null }
-</View>
-    </View>
+    <View style= {{ flex: 1, backgroundColor: '#111' }} />
             )}
 
-<View style={ styles.cornerTag }>
-    <Text style={ styles.cornerTagText }> DOOM </Text>
-        </View>
-        </View>
+{/* ALWAYS KEEP LOGS OVERLAY VISIBLE */ }
+<View style={ { position: 'absolute', top: 10, left: 10, zIndex: 100 } } pointerEvents = "none" >
+    <Text style={ { color: '#fff', fontSize: 13, fontWeight: 'bold', marginBottom: 5 } }> [WASM ENGINE STATUS] </Text>
+{
+    devLogs.map((log, i) => (
+        <Text key= { i } style = {{ color: '#0f0', fontSize: 10, fontFamily: 'monospace', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 1 }}> { '>'} { log } </Text>
+              ))}
+{ statusMessage ? <Text style={ { color: 'red', fontSize: 14, marginTop: 10, fontWeight: 'bold', textShadowColor: '#000', textShadowOffset: { width: 1, height: 1 }, textShadowRadius: 1 } }> !!{ statusMessage }!! </Text> : null }
+</View>
+
+    < View style = { styles.cornerTag } >
+        <Text style={ styles.cornerTagText }> DOOM </Text>
+            </View>
+            </View>
 
 {/* ── RIGHT: Action buttons ── */ }
 <View style={ styles.rightPanel }>
